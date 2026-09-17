@@ -24,6 +24,15 @@ Three properties, one per section below.
    judge.json (`kernels: ["python"]`, `differential: not-run (single
    evaluator)`) rather than reporting a differential it did not run.
 
+4. **A producer profile runs only when it is named.**  ``--model shen:DIR``
+   runs Stage D's typed checker over the model before judging and writes its
+   certificate and ``model_well_formed.json`` into the receipt; without the flag
+   nothing under ``capcov.claims.modelcheck`` or ``capcov.claims.shen`` is
+   imported, the judge reads whatever ``model_*`` files the receipt already has,
+   and a receipt with none is *judged* -- unresolved, with the model premises
+   named as missing -- rather than refused.  Asking for the profile where
+   shen-go is absent is the same named exit 2 an absent Souffle gets.
+
 The default-path byte-identity of the *artifacts* is pinned separately, against
 upstream's own output, in tests/claim_semantics/test_upstream_golden.py.
 """
@@ -45,6 +54,30 @@ GOLDEN = PACKAGE_ROOT / "tests" / "claim_semantics" / "fixtures" / "upstream_gol
 PYTHON_APP = GOLDEN / "python_app"
 RECEIPT = (PACKAGE_ROOT / "tests" / "claim_semantics" / "fixtures"
            / "replay_receipt_target_go_qualified")
+FIXTURES = PACKAGE_ROOT / "tests" / "claim_semantics" / "fixtures"
+MIN_RECEIPT = FIXTURES / "replay_receipt_min"
+MODEL_MIN = FIXTURES / "model_min"
+#: The model digest ``replay_receipt_min`` was hand-built around, and the digest
+#: the committed ``model_min`` sources actually hash to.  ``_receipt_for_model_min``
+#: rewrites the first into the second so the receipt names the model that is in
+#: the tree; nothing else about the fixture changes.
+MIN_RECEIPT_MODEL = "5f0d985d02df45b3790e120f9809e5d4af85edef8079b84b08f5bfdf8439e156"
+
+
+def _shen_go_reason() -> str | None:
+    """Why ``--model shen`` cannot run here, or None.  Uses the CLI's own probe."""
+    from capcov import cli as capcov_cli
+
+    if shutil.which("bifrost") is None:
+        return "bifrost is not on PATH"
+    if capcov_cli._shen_go_binary() is None:
+        return "shen-go is not on PATH, $SHEN_GO or $BIFROST_SHEN_GO"
+    return None
+
+
+SHEN_GO_REASON = _shen_go_reason()
+if SHEN_GO_REASON and os.environ.get("CAPCOV_SHEN_REQUIRED"):
+    raise RuntimeError("CAPCOV_SHEN_REQUIRED is set but " + SHEN_GO_REASON)
 MS = re.compile(rb'("[A-Za-z0-9_]*_ms":\s*)\d+')
 
 
@@ -126,6 +159,59 @@ class ExperimentNamespaceIsLazyTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertNotIn("experiment", proc.stdout)
         self.assertNotIn("claims", proc.stdout)
+
+    def test_every_producer_profile_is_registered(self) -> None:
+        """Including the advisory one, which is registered without being imported."""
+        proc = _capcov("experiment", "claims", "--help")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for subcommand in ("shen", "assumptions", "modelcheck", "static", "jev"):
+            self.assertIn(subcommand, proc.stdout)
+        self.assertIn("advisory", proc.stdout)
+
+    def test_building_the_parser_imports_no_profile(self) -> None:
+        """`--help` answers for every profile without loading any of them."""
+        script = (
+            "import sys\n"
+            "from capcov.claims.cli import main\n"
+            "try:\n"
+            "    main(['claims', '--help'])\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            "print('LOADED', sorted(m for m in sys.modules if m.startswith('capcov.claims.shen') "
+            "or m.startswith('capcov.claims.jev') or m.startswith('capcov.claims.modelcheck') "
+            "or m.startswith('capcov.claims.static')))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], text=True,
+                              capture_output=True, env=_env())
+        self.assertIn("LOADED []", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_naming_one_profile_does_not_import_the_others(self) -> None:
+        """Stage D runs; the shen workbench and the advisory profile stay unloaded."""
+        script = (
+            "import sys\n"
+            "from capcov.claims.cli import main\n"
+            f"main(['claims', 'modelcheck', '--model', {str(MODEL_MIN)!r}])\n"
+            "print('LOADED', sorted(m for m in sys.modules "
+            "if m.startswith('capcov.claims.shen') or m.startswith('capcov.claims.jev')))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], text=True,
+                              capture_output=True, env=_env(PATH="", BIFROST_SHEN_GO=""))
+        self.assertIn("LOADED []", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_advisory_profile_answers_by_name_when_it_is_not_here(self) -> None:
+        """A missing optional profile is a named refusal, never an ImportError."""
+        proc = _capcov("experiment", "claims", "jev")
+        self.assertNotIn("Traceback", proc.stderr)
+        document = json.loads(proc.stdout)
+        if document.get("operational_failure") == "profile-unavailable":
+            self.assertEqual(proc.returncode, 3, proc.stdout)
+            self.assertTrue(document["advisory"])
+            self.assertIn("capcov.claims.jev", document["error"])
+        else:
+            # the module is part of this checkout: then the key gates it, and the
+            # advisory profile still never raises
+            self.assertIn(document.get("operational_failure"),
+                          (None, "jev-unavailable"), document)
 
 
 class JudgeUsageRefusalTests(unittest.TestCase):
@@ -397,6 +483,247 @@ class DefaultEvaluatorNeedsNoToolTests(unittest.TestCase):
         proc, _ = self._judge(out="stdout")
         self.assertIn("kernels python", proc.stdout)
         self.assertIn("differential not-run (single evaluator)", proc.stdout)
+
+
+def _copy_receipt(destination: Path, *, strip_models: bool = False,
+                  model: str | None = None, checker: tuple[str, str] | None = None) -> Path:
+    """A working copy of ``replay_receipt_min``, optionally rewritten.
+
+    ``strip_models`` removes every ``model_*.json`` file -- the receipt keeps its
+    header, which is where ``model_describes_run`` comes from, and loses every
+    model observation.  ``model`` rewrites the model digest everywhere it
+    appears, so a receipt can name the ``model_min`` sources that are actually
+    in the tree.  ``checker`` rewrites the reviewer's admitted checker row.
+    """
+    shutil.copytree(MIN_RECEIPT, destination)
+    if strip_models:
+        for path in destination.glob("model_*.json"):
+            path.unlink()
+    else:
+        (destination / "model_well_formed.json").unlink()
+    if model is not None:
+        for path in destination.rglob("*.json"):
+            text = path.read_text(encoding="utf-8")
+            if MIN_RECEIPT_MODEL in text:
+                path.write_text(text.replace(MIN_RECEIPT_MODEL, model), encoding="utf-8")
+    if checker is not None:
+        path = destination / "model_checkers.json"
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document["rows"] = [{"checker": checker[0], "checker_version": checker[1]}]
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
+    return destination
+
+
+class ModelProfileUsageRefusalTests(unittest.TestCase):
+    """`--model` is a producer profile, and naming it badly is exit 2, not a verdict."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-model-usage-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _refusal(self, *extra: str, judge: bool = True):
+        argv = ["gate", str(PYTHON_APP / "coverage.json")]
+        if judge:
+            argv += ["--judge", "claims", "--receipt", str(RECEIPT),
+                     "--judge-out", str(self.tmp / "judge")]
+        proc = _capcov(*argv, *extra)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertFalse((self.tmp / "judge").exists(),
+                         "a refused judge must leave no artifacts behind")
+        return proc
+
+    def test_a_model_without_the_claims_judge_is_refused_not_ignored(self) -> None:
+        proc = self._refusal("--model", f"shen:{MODEL_MIN}", judge=False)
+        self.assertIn("--model is only meaningful with --judge claims", proc.stderr)
+
+    def test_a_model_that_does_not_name_a_profile_is_refused(self) -> None:
+        proc = self._refusal("--model", str(MODEL_MIN))
+        self.assertIn("names a producer profile and a directory, PROFILE:DIR", proc.stderr)
+
+    def test_an_unknown_profile_names_the_profiles_that_exist(self) -> None:
+        proc = self._refusal("--model", f"souffle:{MODEL_MIN}")
+        self.assertIn("unknown model profile 'souffle'", proc.stderr)
+        self.assertIn("expected one of shen", proc.stderr)
+
+    def test_a_directory_that_is_not_there_is_refused_before_any_work(self) -> None:
+        proc = self._refusal("--model", f"shen:{self.tmp / 'nowhere'}")
+        self.assertIn("is not a model directory", proc.stderr)
+
+    def test_the_capcov_toml_key_is_refused_the_same_way(self) -> None:
+        (self.tmp / "capcov.toml").write_text('[judge]\nmodel = "shen"\n')
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(self.tmp / "judge"),
+                       cwd=self.tmp)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("[judge] model in capcov.toml", proc.stderr)
+
+
+class ModelProfileAbsentToolIsNamedTests(unittest.TestCase):
+    """PATH emptied: asking for Stage D without shen-go is named, and judges nothing."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-model-absent-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_gate_names_shen_go_and_writes_no_judge_artifacts(self) -> None:
+        out = self.tmp / "judge"
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(out),
+                       "--model", f"shen:{MODEL_MIN}",
+                       env=_env(PATH="", SHEN_GO="", BIFROST_SHEN_GO=""))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--model shen needs shen-go", proc.stderr)
+        self.assertIn("bifrost launcher is not on PATH", proc.stderr)
+        self.assertIn("not on PATH, $SHEN_GO or $BIFROST_SHEN_GO", proc.stderr)
+        self.assertIn("Install it with:", proc.stderr)
+        self.assertIn("or drop --model", proc.stderr)
+        self.assertFalse(out.exists(), "a refused judge must leave no artifacts behind")
+
+    def test_reconcile_refuses_before_it_writes_its_own_artifact(self) -> None:
+        coverage = self.tmp / "coverage.json"
+        proc = _capcov("reconcile", str(PYTHON_APP / "capabilities.json"),
+                       str(PYTHON_APP / "observed.json"), "--out", str(coverage),
+                       "--judge", "claims", "--receipt", str(RECEIPT),
+                       "--model", f"shen:{MODEL_MIN}", "--judge-out", str(self.tmp / "judge"),
+                       env=_env(PATH="", SHEN_GO="", BIFROST_SHEN_GO=""))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--model shen needs shen-go", proc.stderr)
+        self.assertFalse(coverage.exists())
+
+
+class NoModelProfileJudgesWhatTheReceiptCarriesTests(unittest.TestCase):
+    """Without the flag: nothing is imported, nothing is run, and nothing is refused."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-model-default-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_the_claims_judge_imports_no_model_checker_unless_asked(self) -> None:
+        """The judge runs in full; capcov.claims.modelcheck and .shen stay unloaded."""
+        script = (
+            "import sys\n"
+            "from capcov.cli import main\n"
+            "try:\n"
+            f"    main(['gate', {str(PYTHON_APP / 'coverage.json')!r}, '--judge', 'claims', "
+            f"'--receipt', {str(MIN_RECEIPT)!r}, '--judge-out', {str(self.tmp / 'out')!r}, "
+            "'--quiet'])\n"
+            "except SystemExit:\n"
+            "    pass\n"
+            "print('MODEL', sorted(m for m in sys.modules if m.startswith('capcov.claims.shen') "
+            "or m.startswith('capcov.claims.modelcheck')))\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], text=True,
+                              capture_output=True, env=_env())
+        self.assertIn("MODEL []", proc.stdout, proc.stdout + proc.stderr)
+        self.assertTrue((self.tmp / "out" / "judge.json").is_file(),
+                        "the judge still judged")
+
+    def test_a_receipt_with_no_model_files_is_judged_unresolved_not_refused(self) -> None:
+        """Every model_* file removed: an answer, not an error.
+
+        Each op comes out semantically ``unresolved`` with its model premises
+        named -- ``model_writes`` (no declared write set was observed) and
+        ``model_well_formed`` (no typed certificate) -- and operationally
+        ``complete``, because nothing failed: the evidence simply is not there.
+        ``model_describes_run`` is NOT among them, and that is not an oversight:
+        the receipt header still names a model, which is where that row comes
+        from.  The verdict is not-supported (exit 1), never a traceback.
+        """
+        receipt = _copy_receipt(self.tmp / "stripped", strip_models=True)
+        out = self.tmp / "stripped-judge"
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(receipt), "--judge-out", str(out))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+        document = json.loads((out / "judge.json").read_text())
+        self.assertEqual(document["verdict"], "not-supported")
+        self.assertEqual(document["contract_findings"], [])
+        self.assertTrue(document["ops"], "the receipt was still judged op by op")
+        for op, entry in document["ops"].items():
+            with self.subTest(op=op):
+                self.assertEqual(entry["op_qualified"]["semantic"], "unresolved")
+                self.assertEqual(entry["op_qualified"]["operational"], "complete")
+                self.assertIn("model_well_formed", entry["op_qualified"]["missing_premises"])
+                self.assertIn("model_writes", entry["op_qualified"]["missing_premises"])
+
+    def test_the_same_receipt_with_its_certificate_is_supported(self) -> None:
+        """The control: only the model premises were missing above."""
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(MIN_RECEIPT), "--judge-out", str(self.tmp / "intact"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+
+@unittest.skipIf(SHEN_GO_REASON, f"needs shen-go through bifrost ({SHEN_GO_REASON})")
+class ModelProfilePreflightTests(unittest.TestCase):
+    """The present path: Stage D runs, writes into the receipt, and the judge reads it.
+
+    The receipt is ``replay_receipt_min`` rewritten to name the ``model_min``
+    sources that are committed in this tree (its hand-built digest names no
+    model anyone can check) and stripped of the hand-written
+    ``model_well_formed.json``.  Without the flag that receipt is *pending* the
+    Stage D premise; with it the premise is a real certificate produced here.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-model-preflight-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        sys.path.insert(0, str(SRC))
+        self.addCleanup(sys.path.remove, str(SRC))
+        from capcov.claims import modelcheck
+
+        self.digest = modelcheck.model_digest(MODEL_MIN)
+
+    def _gate(self, receipt: Path, out: str, *extra: str):
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(receipt), "--judge-out", str(self.tmp / out), *extra)
+        return proc, json.loads((self.tmp / out / "judge.json").read_text())
+
+    def test_without_the_flag_the_receipt_is_pending_the_stage_d_premise(self) -> None:
+        receipt = _copy_receipt(self.tmp / "pending", model=self.digest)
+        proc, document = self._gate(receipt, "pending-out")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertEqual(document["verdict"], "pending-premise")
+        self.assertEqual(document["exit_code"], 5)
+        self.assertFalse((receipt / "model_well_formed.json").exists())
+
+    def test_the_profile_writes_the_certificate_into_the_receipt_before_judging(self) -> None:
+        receipt = _copy_receipt(self.tmp / "checked", model=self.digest)
+        proc, document = self._gate(receipt, "checked-out", "--model", f"shen:{MODEL_MIN}")
+        self.assertIn(f"model {self.digest[:12]} is well-formed", proc.stdout)
+        certificate = json.loads((receipt / "modelcheck-certificate.json").read_text())
+        self.assertEqual(certificate["verdict"], "well-formed")
+        self.assertEqual(certificate["model"], self.digest)
+        fact = json.loads((receipt / "model_well_formed.json").read_text())
+        [row] = fact["rows"]
+        self.assertEqual(row["model"], self.digest)
+        self.assertEqual(row["checker"], "capcov-modelcheck")
+        self.assertEqual(row["certificate"], certificate["certificate_sha256"])
+        self.assertTrue((receipt / "modelcheck-transcript.txt").is_file())
+        # the premise the judge was pending is now met; what it is still pending
+        # is the reviewer's admission of THIS checker, which no producer may grant
+        # itself -- the fixture admits a different one
+        self.assertEqual(document["verdict"], "pending-premise")
+        for entry in document["ops"].values():
+            self.assertNotIn("model_well_formed", entry["op_qualified"]["missing_premises"])
+            self.assertEqual(entry["qualification"], "pending model_checker_admitted")
+
+    def test_with_the_checker_admitted_the_same_run_is_supported(self) -> None:
+        """End to end: the reviewer admits capcov-modelcheck, Stage D runs, verdict supported."""
+        receipt = _copy_receipt(self.tmp / "admitted", model=self.digest,
+                                checker=("capcov-modelcheck", "1.0.0"))
+        proc, document = self._gate(receipt, "admitted-out", "--model", f"shen:{MODEL_MIN}")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(document["verdict"], "supported")
+
+    def test_a_model_the_receipt_does_not_name_is_a_contract_finding(self) -> None:
+        """Fail-closed: a certificate for another model never becomes this run's premise."""
+        receipt = _copy_receipt(self.tmp / "foreign")
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(receipt), "--judge-out", str(self.tmp / "foreign-out"),
+                       "--model", f"shen:{MODEL_MIN}")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("contract finding", proc.stderr)
+        self.assertIn("the certificate is for another model", proc.stderr)
 
 
 if __name__ == "__main__":

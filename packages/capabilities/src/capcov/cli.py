@@ -523,6 +523,14 @@ JUDGE_OUT_DEFAULT = "capcov-judge"
 #: alone, so `--judge claims` needs no optional tool either.  `souffle` and
 #: `souffle-compiled` are asked for by name, exactly like `--resolver scip`.
 JUDGE_EVALUATOR_DEFAULT = "python"
+#: Producer profiles `--model` can run before judging.  A profile re-sources one
+#: premise of the verdict from a producer the receipt did not carry; naming one
+#: is the whole opt-in, exactly like `--resolver scip` and `--evaluator souffle`.
+JUDGE_MODEL_PROFILES = ("shen",)
+SHEN_GO_INSTALL_HINT = (
+    "enter the pinned devShell with `nix develop` (it pins shen-go) and put the "
+    "bifrost launcher on PATH, or name the binary in $SHEN_GO"
+)
 
 
 class _JudgeUsage(Exception):
@@ -616,13 +624,95 @@ def _judge_evaluators(args: argparse.Namespace, command: str) -> tuple[str, ...]
     return names
 
 
-def _judge_setup(args: argparse.Namespace, command: str) -> tuple[str, tuple[str, ...]]:
-    """Resolve the engine and evaluators, and refuse an incoherent combination.
+def _shen_go_binary() -> str | None:
+    """The shen-go binary the Stage D checker will run, or None.
 
-    ``--receipt``, ``--judge-out`` and ``--evaluator`` say nothing to the
-    four-cell judge, so passing them without asking for the claims judge is
-    refused rather than silently ignored: a flag that does nothing is how a gate
-    ends up green for the wrong reason.
+    ``$BIFROST_SHEN_GO`` (what ``claims.modelcheck`` itself reads) first, then
+    ``$SHEN_GO``, then ``shen-go`` on PATH.  Resolving the last two here rather
+    than in ``modelcheck`` keeps the checker's own contract -- name the pinned
+    binary explicitly -- exactly as it was; this is the CLI saying which binary
+    the flag meant.
+    """
+    import shutil
+
+    for value in (os.environ.get("BIFROST_SHEN_GO"), os.environ.get("SHEN_GO")):
+        if value and os.path.isfile(value) and os.access(value, os.X_OK):
+            return value
+    return shutil.which("shen-go")
+
+
+def _require_shen_go(command: str) -> str:
+    """The binary ``--model shen`` needs, or a named refusal that judges nothing.
+
+    The ``--resolver scip`` convention: raised BEFORE any work, naming the tool,
+    where it was looked for, how to install it, and what to do instead -- here,
+    drop the flag and judge the ``model_*`` files the receipt already carries,
+    which needs nothing.
+    """
+    import shutil
+
+    missing = []
+    if shutil.which("bifrost") is None:
+        missing.append("the bifrost launcher is not on PATH")
+    binary = _shen_go_binary()
+    if binary is None:
+        missing.append("the shen-go binary is not on PATH, $SHEN_GO or $BIFROST_SHEN_GO")
+    if missing:
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: --model shen needs shen-go and "
+            f"{'; '.join(missing)}. Install it with: {SHEN_GO_INSTALL_HINT}; or drop "
+            f"--model and judge the model_* files the receipt already carries"
+        )
+    return binary
+
+
+def _judge_model(args: argparse.Namespace, command: str) -> tuple[str, Path, str] | None:
+    """Which producer profile runs before the judge: ``--model``, then ``[judge] model``.
+
+    ``None`` -- the default -- means no profile runs, nothing under
+    ``capcov.claims.modelcheck`` is imported, and the judge reads whatever
+    ``model_*`` files the receipt already has.  A receipt with none is judged,
+    not refused: its model premises are reported as missing and the ops they
+    carry come out unresolved, which is the honest answer.
+
+    ``PROFILE:DIR`` is the spelling (``shen:<model dir>`` today), and the
+    profile's runtime is probed here, before any work.
+    """
+    value = getattr(args, "model", None)
+    source = "--model"
+    if value is None:
+        value = _judge_block().get("model")
+        source = "[judge] model in capcov.toml"
+    if value is None:
+        return None
+    if not isinstance(value, str) or ":" not in value:
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: {source} names a producer profile and a "
+            f"directory, PROFILE:DIR (for instance shen:<model dir>), got {value!r}"
+        )
+    profile, _, directory = value.partition(":")
+    if profile not in JUDGE_MODEL_PROFILES:
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: unknown model profile {profile!r} "
+            f"({source}); expected one of {', '.join(JUDGE_MODEL_PROFILES)}"
+        )
+    if not directory or not Path(directory).is_dir():
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: --model {profile}: {directory!r} is not a "
+            f"model directory"
+        )
+    return profile, Path(directory), _require_shen_go(command)
+
+
+def _judge_setup(args: argparse.Namespace,
+                 command: str) -> tuple[str, tuple[str, ...], tuple[str, Path, str] | None]:
+    """Resolve the engine, the evaluators and the model profile, and refuse an
+    incoherent combination.
+
+    ``--receipt``, ``--judge-out``, ``--evaluator`` and ``--model`` say nothing
+    to the four-cell judge, so passing them without asking for the claims judge
+    is refused rather than silently ignored: a flag that does nothing is how a
+    gate ends up green for the wrong reason.
     """
     engine = _judge_engine(args, command)
     if engine == "claims":
@@ -637,19 +727,73 @@ def _judge_setup(args: argparse.Namespace, command: str) -> tuple[str, tuple[str
                 f"capcov {command} --judge claims: {receipt} is not a replay receipt "
                 f"directory (no receipt.json in it)"
             )
-        return engine, _judge_evaluators(args, command)
+        return engine, _judge_evaluators(args, command), _judge_model(args, command)
     for flag, value in (("--receipt", getattr(args, "receipt", None)),
                         ("--judge-out", getattr(args, "judge_out", JUDGE_OUT_DEFAULT)),
-                        ("--evaluator", getattr(args, "evaluator", None))):
+                        ("--evaluator", getattr(args, "evaluator", None)),
+                        ("--model", getattr(args, "model", None))):
         if value not in (None, JUDGE_OUT_DEFAULT):
             raise _JudgeUsage(
                 f"capcov {command}: {flag} is only meaningful with --judge claims"
             )
-    return engine, ()
+    return engine, (), None
+
+
+def _run_model_preflight(args: argparse.Namespace, command: str,
+                         model: tuple[str, Path, str]) -> int | None:
+    """Run the named producer profile over the model, into the receipt directory.
+
+    Stage D's checker (``capcov experiment claims modelcheck --model DIR --out
+    <receipt>``) is the profile, reached by importing its module here -- inside
+    the branch ``--model shen`` selects -- so a judge without the flag never
+    loads it.  It writes ``modelcheck-certificate.json``, the transcript and,
+    for a well-formed model only, the ``model_well_formed.json`` the exporter
+    reads; an ill-formed verdict removes a stale one rather than leaving it.
+
+    Returns an exit code when the run must stop, ``None`` when the judge should
+    go on.  A checker that reached no verdict stops the run (exit 2): judging
+    on could silently read a *previous* run's certificate and call it this
+    model's.  An ill-formed model does not stop it -- the certificate says so,
+    no fact was written, and the judge reports the missing premise, which is
+    the honest verdict rather than a refusal.
+    """
+    profile, root, binary = model
+    from .claims import modelcheck
+
+    receipt = Path(args.receipt)
+    # the checker names its runtime through $BIFROST_SHEN_GO and refuses to guess;
+    # the flag already resolved which binary it meant (PATH / $SHEN_GO included),
+    # so tell it, rather than widening what `modelcheck` will accept
+    os.environ["BIFROST_SHEN_GO"] = binary
+    report = modelcheck.preflight(root, out_dir=receipt)
+    status = report["status"]
+    if status == "unavailable":
+        # probed in _judge_setup before any work; only a racing environment gets here
+        print(f"capcov {command} --judge claims: --model {profile}: the checker's runtime "
+              f"became unavailable: {report['error']}", file=sys.stderr)
+        return 2
+    if status == "failed":
+        print(f"capcov {command} --judge claims: --model {profile}: the checker reached no "
+              f"verdict, so this model is unchecked: {report['error']}", file=sys.stderr)
+        return 2
+    digest = str(report["model"] or "")[:12]
+    if status == "ill-formed":
+        failures = ", ".join(f"{failure['id']}: {failure['message']}"
+                             for failure in report["failures"]) or "no judgement passed"
+        print(f"capcov {command} --judge claims: --model {profile}: model {digest} is "
+              f"ill-formed ({failures}); no model_well_formed fact was written",
+              file=sys.stderr)
+        return None
+    if not args.quiet:
+        print(f"capcov {command} --judge claims: --model {profile}: model {digest} is "
+              f"well-formed (certificate {str(report['certificate_sha256'])[:12]}); wrote "
+              f"{receipt / 'model_well_formed.json'}")
+    return None
 
 
 def _run_claims_judge(args: argparse.Namespace, command: str,
-                      evaluators: tuple[str, ...]) -> int:
+                      evaluators: tuple[str, ...],
+                      model: tuple[str, Path, str] | None = None) -> int:
     """Judge the receipt with the claims judge and collapse its verdict to pass/fail.
 
     The one place `capcov.cli` reaches into `capcov.claims`, and it is reached
@@ -665,6 +809,10 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
     """
     from .claims.replay import judge as claims_judge
 
+    if model is not None:
+        refusal = _run_model_preflight(args, command, model)
+        if refusal is not None:
+            return refusal
     receipt = Path(args.receipt)
     out_dir = Path(args.judge_out)
     try:
@@ -696,7 +844,7 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
-        engine, evaluators = _judge_setup(args, "reconcile")
+        engine, evaluators, model = _judge_setup(args, "reconcile")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -787,13 +935,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # claims changes is who decides: a successful reconcile hands the verdict to
     # the replay judge, and a failed one is still reconcile's own answer.
     if engine == "claims" and rc == 0:
-        return _run_claims_judge(args, "reconcile", evaluators)
+        return _run_claims_judge(args, "reconcile", evaluators, model)
     return rc
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
     try:
-        engine, evaluators = _judge_setup(args, "gate")
+        engine, evaluators, model = _judge_setup(args, "gate")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -801,7 +949,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     # judge; what --judge claims replaces is the verdict, not the input.
     coverage = artifacts.read(Path(args.coverage), "coverage")
     if engine == "claims":
-        return _run_claims_judge(args, "gate", evaluators)
+        return _run_claims_judge(args, "gate", evaluators, model)
     exemptions = Path(args.exemptions) if args.exemptions else None
     failures = gate_mod.gate(coverage, exemptions)
     if not failures:
@@ -905,6 +1053,18 @@ def main(argv: list[str] | None = None) -> int:
             "Two or more run the fail-closed differential; one records "
             "differential 'not-run (single evaluator)'. Falls back to [judge] "
             "evaluator in capcov.toml, then python.",
+        )
+        p.add_argument(
+            "--model",
+            default=None,
+            metavar="PROFILE:DIR",
+            help="run a producer profile over a model before judging: 'shen:DIR' "
+            "typechecks the Shen domain model in DIR (Stage D) and writes "
+            "model_well_formed.json and the certificate into --receipt. Needs shen-go "
+            "(bifrost plus $SHEN_GO/$BIFROST_SHEN_GO or shen-go on PATH) and is refused "
+            "by name when it is absent. Without the flag the judge reads the model_* "
+            "files the receipt already carries. Falls back to [judge] model in "
+            "capcov.toml.",
         )
         p.add_argument(
             "--receipt",
