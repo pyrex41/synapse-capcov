@@ -46,8 +46,10 @@ PYTHONPATH="$PWD/src" python3 -m unittest discover -s tests -t . -v
 ```
 
 Result: **`Ran 672 tests` — `OK (skipped=125)`**, exit 0.
-Full transcript in `suite/unittest.log`; `suite/summary.txt` and
-`suite/skips.txt` are the two lines and the skip histogram.
+`suite/summary.txt` and `suite/skips.txt` are the two result lines and the skip
+histogram, and they are what is committed: the full `-v` transcript is a `*.log`
+(gitignored, and 130 KB of per-test lines that say nothing the histogram does
+not), so it is reproduced by re-running the command above rather than stored.
 
 All 125 skips are genuine tool/extra absence, not silent green:
 
@@ -110,7 +112,10 @@ ValueError: treesitter-routes needs the 'treesitter' extra
 ```
 
 and writes no `capabilities.json`. `--resolver scip` on the same fixture fails
-identically (the adapter is reached before the resolver). This is the shape our
+identically (the adapter is reached before the resolver). There is therefore no
+`go_app/coverage.json` and no `go_app` gate to record: with no extras the go
+fixture never gets past `discover`, so `python_app/` is the golden for
+`reconcile` and `gate`. This is the shape our
 additions must copy.
 
 ### `--resolver scip`, the convention being copied
@@ -164,8 +169,9 @@ are rewritten, and nothing else:
 | `"extracted_at"` | ISO-8601 instant | `"<timestamp>"` | wall clock |
 | any `"<name>_ms"` | int | `0` | wall clock: `discover_ms`, `observe_ms`, `reconcile_ms`, `total_ms`, `duration_ms` |
 
-`suite/unittest.log` additionally has `Ran N tests in <elapsed>s`, per-test
-`(<elapsed>)` and `/tmp/tmpXXXXXXXX` temp dirs tokenized.
+`suite/summary.txt` additionally has `Ran N tests in <elapsed>s` tokenized (the
+same rule a re-run's transcript needs: per-test `(<elapsed>)` and
+`/tmp/tmpXXXXXXXX` temp dirs).
 
 **Deliberately NOT normalized:** `derived_from.source_snapshot`, its
 `artifact_sha256`, file counts, every capability/surface/entity/binding, every

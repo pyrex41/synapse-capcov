@@ -26,13 +26,14 @@ Two documented exceptions, each with its own test rather than a silent skip:
   that exists appears in its command's help -- upstream's own
   `discover --help` lists `--resolver` for exactly this reason.
   `test_reconcile_and_gate_help_gains_only_the_judge_flags` pins the delta to
-  exactly `--judge`, `--receipt`, `--judge-out`, `--evaluator`: no upstream
-  option lost, no fifth option gained.
+  exactly `--judge`, `--receipt`, `--judge-out`, `--evaluator`, `--model`: no
+  upstream option lost, no sixth option gained.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import importlib.util
 import os
 import shutil
 import subprocess
@@ -48,7 +49,28 @@ NORMALIZE = GOLDEN / "normalize.py"
 META = {"README.md", "MANIFEST.json", "generate.py", "normalize.py"}
 # the two commands that gained the opt-in --judge flags; pinned by their own test
 HELP_WITH_JUDGE = {"cli/help_reconcile.stdout", "cli/help_gate.stdout"}
-JUDGE_FLAGS = {"--judge", "--receipt", "--judge-out", "--evaluator"}
+#: Every option the two commands gained, and the whole of it: the judge itself,
+#: what it judges, where it writes, which kernels run and which producer profile
+#: runs before it.  Growing this set is a deliberate act -- an opt-in flag lands
+#: with its entry here or the golden comparison fails.
+JUDGE_FLAGS = {"--judge", "--receipt", "--judge-out", "--evaluator", "--model"}
+
+
+#: The golden was recorded with **no extras installed** (README: "installed
+#: extras: none"), and the recorded runs depend on that: go_app/discover exits 1
+#: precisely because the treesitter extra is absent, and the python_app probe
+#: output is pytest's absence.  PATH can be hidden from a subprocess; an
+#: importable package cannot, so an interpreter that has one of these is not the
+#: interpreter this fixture describes, and the comparison would fail as an opaque
+#: byte-diff rather than as the precondition it is.
+GOLDEN_EXTRAS = ("tree_sitter", "pytest", "yaml")
+
+
+def _installed_extras() -> list[str]:
+    return [name for name in GOLDEN_EXTRAS if importlib.util.find_spec(name) is not None]
+
+
+INSTALLED_EXTRAS = _installed_extras()
 
 
 def _hidden_path() -> str:
@@ -63,12 +85,23 @@ def _hidden_path() -> str:
 
 
 def _options(help_text: str) -> set[str]:
-    """Every long option argparse printed, regardless of how it wrapped the column."""
-    return {token.rstrip(",")
+    """Every long option argparse printed, regardless of how it wrapped the column.
+
+    Help *prose* names options too ("...writes it into --receipt. Needs..."), so
+    the sentence punctuation an option name can never contain is stripped;
+    without that a help string that ends a sentence on an option invents a flag
+    that does not exist and the delta below is wrong in both directions.
+    """
+    return {token.strip("(),.;:'`\"[]")
             for token in help_text.replace("\n", " ").split()
             if token.startswith("--") and len(token) > 2}
 
 
+@unittest.skipIf(
+    INSTALLED_EXTRAS,
+    "the golden records a run with NO extras installed; this interpreter can import "
+    + ", ".join(INSTALLED_EXTRAS)
+    + " -- re-run it on a bare interpreter (the pinned devShell's python, or host python3)")
 class UpstreamGoldenTests(unittest.TestCase):
     """One generate+normalize for the whole class; the comparisons are pure."""
 
@@ -101,21 +134,38 @@ class UpstreamGoldenTests(unittest.TestCase):
         shutil.rmtree(cls.workspace, ignore_errors=True)
 
     def _relative_golden_files(self) -> list[str]:
+        """Every recorded artifact: the files the generator re-derives.
+
+        ``suite/`` is the recorded run of upstream's own unittest suite, which
+        this test does not re-run; it is pinned by the manifest below like
+        everything else, and excluded only from the artifact comparisons.
+        """
         return sorted(
             str(path.relative_to(GOLDEN)) for path in GOLDEN.rglob("*")
             if path.is_file() and path.name not in META
             and not str(path.relative_to(GOLDEN)).startswith("suite/"))
 
     def test_the_golden_bytes_are_the_ones_the_manifest_names(self) -> None:
-        """Prove the comparison below read upstream's committed bytes, not a re-baseline."""
+        """Prove the comparison below read upstream's committed bytes, not a re-baseline.
+
+        Over every committed file, ``suite/`` included, and in both directions: a
+        file the manifest does not name is drift, and a manifest entry with no
+        file is a manifest that names something this tree does not have.
+        """
         manifest = json.loads((GOLDEN / "MANIFEST.json").read_text())["sha256"]
+        # every file in the fixture except the gitignored transcript (*.log): the
+        # recorded artifacts, the suite/ record and the two generator scripts
+        present = {str(path.relative_to(GOLDEN)) for path in GOLDEN.rglob("*")
+                   if path.is_file() and not path.name.endswith(".log")}
         drifted = {
             name: hashlib.sha256((GOLDEN / name).read_bytes()).hexdigest()
-            for name in self._relative_golden_files()
-            if name in manifest
+            for name in sorted(manifest)
+            if name in present
             and hashlib.sha256((GOLDEN / name).read_bytes()).hexdigest() != manifest[name]}
         self.assertEqual(drifted, {})
         self.assertEqual(set(self._relative_golden_files()) - set(manifest), set())
+        self.assertEqual(set(manifest) - present, set(),
+                         "the manifest names a file this tree does not have")
 
     def test_every_default_path_artifact_is_byte_identical_to_upstream(self) -> None:
         differing, missing = [], []

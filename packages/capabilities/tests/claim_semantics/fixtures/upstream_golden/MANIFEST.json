@@ -98,8 +98,7 @@
     "structured_spec/discover.stdout": "6bc75a845efbcda8a854d833d45c6dad5bf13281d2c86c58344ba9fff66806bf",
     "structured_spec/openapi.json": "925bdd42d6e4877831fda2f41eaf13faa20bed88533b25e4e4a158299b00ad05",
     "suite/skips.txt": "b59ef2d36222bc6a91b677bf74b29445e918abbf5dbe02205f75c1a4a53aee8a",
-    "suite/summary.txt": "2b85de861c52f01996ec5c73c9762ec13751d024ad4c4d6362a4a53e95caf97c",
-    "suite/unittest.log": "ffbf6a9d0c3707f392fb10402223b3524dc10f6ea7c9792e3a8bb153685911cb"
+    "suite/summary.txt": "2b85de861c52f01996ec5c73c9762ec13751d024ad4c4d6362a4a53e95caf97c"
   },
   "upstream_commit": "1b6a47a571a32c68fa056a4fe44c51258c2d8f42",
   "upstream_commit_short": "1b6a47a"
