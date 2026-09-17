@@ -6005,4 +6005,3 @@ optional cross-check", to land when the code does. Stage D's import footprint wa
 this: `import capcov.claims.modelcheck` loads only the pure IR/validation/verdict/output modules,
 shells out only inside `check()`, and names its missing runtime; `preflight(model_dir)` (to add)
 returns a status dict and never raises, for the `--model` profile to call.
-
