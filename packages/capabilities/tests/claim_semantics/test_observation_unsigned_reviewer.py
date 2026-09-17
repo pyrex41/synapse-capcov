@@ -19,6 +19,10 @@ from pathlib import Path
 
 from capcov.claims.observation import observation_facts as facts
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 AGREE = HERE / "fixtures" / "observation_receipt_agree"
 
@@ -37,7 +41,7 @@ def _copy_with_reviewer(reviewer: str) -> tempfile.TemporaryDirectory:
 
 class UnsignedReviewerTest(unittest.TestCase):
     def test_a_signed_ledger_admits(self) -> None:
-        result = facts.export_bundle(AGREE)
+        result = _export_fixture(AGREE)
         self.assertEqual(result.status, facts.STATUS_COMPLETE, "; ".join(result.messages))
         self.assertEqual(result.counts["policy_admitted"], 1)
         self.assertEqual(result.counts["scenario_set_admitted"], 1)
@@ -46,7 +50,7 @@ class UnsignedReviewerTest(unittest.TestCase):
         for reviewer in sorted(facts.UNSIGNED_REVIEWERS - {""}) + ["Unassigned", "  TBD  "]:
             with self.subTest(reviewer=reviewer):
                 with _copy_with_reviewer(reviewer) as tmp:
-                    result = facts.export_bundle(Path(tmp) / "receipt")
+                    result = _export_fixture(Path(tmp) / "receipt")
                 self.assertEqual(result.counts.get("policy_admitted", 0), 0, reviewer)
                 self.assertEqual(result.counts.get("scenario_set_admitted", 0), 0, reviewer)
                 self.assertEqual(result.counts.get("masked_difference_admitted", 0), 0, reviewer)
@@ -57,13 +61,13 @@ class UnsignedReviewerTest(unittest.TestCase):
     def test_an_unsigned_ledger_is_handled_like_an_absent_one(self) -> None:
         """Same rows, same missing premise, only the disclosure sentence differs."""
         with _copy_with_reviewer("unassigned") as tmp:
-            unsigned = facts.export_bundle(Path(tmp) / "receipt")
+            unsigned = _export_fixture(Path(tmp) / "receipt")
         tmp2 = tempfile.TemporaryDirectory(prefix="capcov-observation-absent-")
         with tmp2:
             root = Path(tmp2.name) / "receipt"
             shutil.copytree(AGREE, root)
             (root / facts.ADMISSIONS_FILE).unlink()
-            absent = facts.export_bundle(root)
+            absent = _export_fixture(root)
         admitted = ("policy_admitted", "scenario_set_admitted", "masked_difference_admitted")
         self.assertEqual({k: unsigned.counts.get(k, 0) for k in admitted},
                          {k: absent.counts.get(k, 0) for k in admitted})

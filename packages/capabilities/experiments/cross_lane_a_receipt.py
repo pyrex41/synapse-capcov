@@ -95,7 +95,7 @@ def main(argv: list[str]) -> int:
 
     # ------------------------------------------------------------------ 1. export
     section("1. EXPORTER: observation_facts.export_bundle")
-    exported = facts.export_bundle(receipt_dir, run=run)
+    exported = facts.export_bundle(receipt_dir, run=run, allow_receipt_admissions=True)
     print("receipt dir:", receipt_dir.name)
     print("run:", run)
     print("status:", exported.status)

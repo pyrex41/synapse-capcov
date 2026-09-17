@@ -30,6 +30,10 @@ from capcov.claims.static.certificate import certify, recheck
 from capcov.claims.observation import observation_facts as facts
 from capcov.claims.observation import join as observation_join
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 AGREE = FIXTURES / "observation_receipt_agree"
@@ -180,7 +184,7 @@ class MustNotDeriveTest(unittest.TestCase):
             receipt["scenario_set"]["count"] = 0
 
         with _Variant(AGREE, mutate=empty) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("an empty set agrees for free", result.messages[0])
 
@@ -274,7 +278,7 @@ class MustNotDeriveTest(unittest.TestCase):
                                     "at": "2026-09-16T09:14:10Z"}]
 
         with _Variant(AGREE, mutate=lying_terminal) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("a run that failed to set up did not compare", result.messages[0])
 
@@ -445,7 +449,7 @@ class SourceIdentityTest(unittest.TestCase):
             receipt["sources"]["candidate"]["tree"] = "0" * 40
 
         with _Variant(AGREE, mutate=bend) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("does not recompute from the candidate tree and incumbent manifest",
                       result.messages[0])
@@ -470,7 +474,7 @@ class StabilityTest(unittest.TestCase):
 
     def test_dropping_the_repeat_block_without_saying_so_is_refused(self) -> None:
         with _Variant(AGREE, mutate=lambda receipt: receipt.pop("repeat")) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("unassessed is missing 'oracle_stability'", result.messages[0])
 
@@ -513,7 +517,7 @@ class ModelFreedomTest(unittest.TestCase):
                 "closed": False, "reason": "the dimension list was truncated"}
 
         with _Variant(AGREE, mutate=open_unassessed) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("an open list of what was not assessed is not a disclosure",
                       result.messages[0])
@@ -560,7 +564,7 @@ class UnreachableThroughTheExporterTest(unittest.TestCase):
                  "after_digest": "2" * 64}]
 
         with _Variant(AGREE, mutate=undeclared) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("which the admitted policy does not declare as a normalization",
                       result.messages[0])
@@ -588,7 +592,7 @@ class UnreachableThroughTheExporterTest(unittest.TestCase):
                  "failure": None})
 
         with _Variant(AGREE, mutate=ghost) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("which the admitted set does not declare", result.messages[0])
 

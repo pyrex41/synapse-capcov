@@ -28,6 +28,10 @@ from pathlib import Path
 from capcov.claims import canonical_json, validate_bundle
 from capcov.claims.observation import observation_facts as facts
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 AGREE = FIXTURES / "observation_receipt_agree"
@@ -70,7 +74,7 @@ def note_every_row(document: dict) -> None:
 
 
 def exported(root: Path):
-    result = facts.export_bundle(root)
+    result = _export_fixture(root)
     return result
 
 

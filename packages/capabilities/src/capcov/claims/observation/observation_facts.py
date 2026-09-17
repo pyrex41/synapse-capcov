@@ -25,8 +25,11 @@ unless the receipt states in exported rows that it assessed no model.
 
 RECEIPT DIRECTORY CONTRACT
 --------------------------
-``<root>/.work/observation/<check>/`` holds ``receipt.json``, optionally
-``log.txt``, and optionally the reviewer's ``observation_admissions.json``.
+``<root>/.work/observation/<check>/`` holds ``receipt.json`` and required
+``log.txt``, plus a receipt-local ``observation_admissions.json`` only for
+fixture tests. Production calls
+must pass admissions as an external file with an independently captured digest;
+the receipt-local copy is available only with the explicit fixture-test option.
 ``receipt.json`` is ONE canonical JSON document (sorted keys, UTF-8) with the
 blocks of ``REQUIRED_BLOCKS``; ``repeat`` is the only optional block.  Every
 digest is lowercase 64-hex sha256 and ``run.id`` is its first 16 hex.
@@ -1298,6 +1301,12 @@ def _read_repeat(receipt: Mapping[str, Any], declared: set[str]) -> dict[str, An
         if scenario not in declared:
             raise _refuse("R-2", f"repeat.compared_scenarios names {scenario!r}, which the "
                                  f"admitted set does not declare")
+    if len(scenarios) != len(set(scenarios)):
+        raise _refuse("R-2", "repeat.compared_scenarios contains a duplicate scenario")
+    if set(scenarios) != declared:
+        missing = sorted(declared - set(scenarios))
+        raise _refuse("R-2", f"repeat.compared_scenarios does not cover the admitted set; "
+                               f"missing {missing}")
     return {"side": _one_of(block["side"], SIDES, "repeat.side", "R-2"),
             "run_a": _text(block["run_a"], "repeat.run_a"),
             "run_b": _text(block["run_b"], "repeat.run_b"),
@@ -1484,11 +1493,11 @@ def _check_log(receipt: Mapping[str, Any], receipt_dir: Path, limits: ExportLimi
     declared = _sha256(block["sha256"], "log.sha256")
     path = receipt_dir / LOG_FILE
     if not path.is_file():
-        # Absence is recorded, never treated as a pass: the receipt claims a log
-        # whose bytes nobody can check.
-        messages.append(f"{LOG_FILE} absent: the receipt's log digest {declared[:12]} was not "
-                        f"verified against any bytes")
-        return {"verified": False, "sha256": declared, "markers_checked": len(markers)}
+        # A required log block whose bytes are absent cannot support a live
+        # observation. Do not let a disclosure message coexist with a passing
+        # claim that silently ignored the unverifiable log.
+        raise _refuse("R-3", f"{LOG_FILE} is absent; declared digest {declared[:12]!r} "
+                             "was not verified against any bytes")
     text = _read_text(path, limits.file_bytes)
     _scan_text(text, LOG_FILE, forbidden)
     actual = hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -1503,12 +1512,16 @@ def _check_log(receipt: Mapping[str, Any], receipt_dir: Path, limits: ExportLimi
 
 def _read_admissions(receipt_dir: Path, policy_digest: str, set_digest: str, check_id: str,
                      limits: ExportLimits, messages: list[str],
-                     forbidden: tuple[str, ...]) -> tuple[str | None, list[dict[str, Any]]]:
-    """The reviewer's ledger.  Absent is an absent premise, not a refusal."""
-    path = receipt_dir / ADMISSIONS_FILE
-    if not path.is_file():
-        messages.append(f"{ADMISSIONS_FILE} absent: no reviewer admitted this comparison policy "
-                        f"or this scenario set, so the claim has no admission to rest on")
+                     forbidden: tuple[str, ...], *, admissions_path: Path | None,
+                     allow_receipt_admissions: bool) -> tuple[str | None, list[dict[str, Any]]]:
+    """Read only externally supplied admissions unless fixture access is explicit."""
+    path = admissions_path
+    if path is None and allow_receipt_admissions:
+        path = receipt_dir / ADMISSIONS_FILE
+    if path is None or not path.is_file():
+        messages.append("external observation admission record absent: no reviewer admitted "
+                        "this comparison policy or scenario set, so the claim has no admission "
+                        "to rest on")
         return None, []
     text = _read_text(path, limits.file_bytes)
     _scan_text(text, ADMISSIONS_FILE, forbidden)
@@ -1592,7 +1605,9 @@ def _read_admissions(receipt_dir: Path, policy_digest: str, set_digest: str, che
 
 def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
                   limits: ExportLimits | None = None,
-                  forbidden_strings: tuple[str, ...] | None = None) -> ExportResult:
+                  forbidden_strings: tuple[str, ...] | None = None,
+                  admissions_path: str | Path | None = None,
+                  allow_receipt_admissions: bool = False) -> ExportResult:
     """Export one observation receipt directory as a validated ``Bundle``.
 
     ``run`` is the run the caller expects; ``None`` takes the receipt's own
@@ -1601,9 +1616,15 @@ def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
     ``resource-exhausted`` (a limit tripped), ``stale`` (the reviewer's ledger
     reviewed another policy, set or check) or ``invalid-input`` (any of
     R-1..R-15, or bundle validation failed).  Never raises for a limit or a
-    malformed receipt.
+    malformed receipt. Receipt-local admissions are ignored by default. Tests
+    for committed golden receipts must opt in with
+    ``allow_receipt_admissions=True``; live callers should instead supply an
+    external ``admissions_path`` whose exact bytes they bind independently.
     """
     receipt_dir = Path(receipt_dir)
+    if admissions_path is not None and allow_receipt_admissions:
+        return ExportResult(STATUS_INVALID_INPUT, None, {},
+                            ("external admissions and fixture receipt admissions are mutually exclusive",))
     limits = limits or ExportLimits()
     forbidden = (FORBIDDEN_FORK_STRINGS if forbidden_strings is None
                  else tuple(s.lower() for s in forbidden_strings))
@@ -1771,9 +1792,11 @@ def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
                             "unresolved and oracle_stability is a mandatory unassessed row")
 
         # --- the reviewer's admissions ---------------------------------------
-        source, admissions = _read_admissions(receipt_dir, policy["digest"],
-                                              scenario_set["digest"], check["id"], limits,
-                                              messages, forbidden)
+        source, admissions = _read_admissions(
+            receipt_dir, policy["digest"], scenario_set["digest"], check["id"], limits,
+            messages, forbidden,
+            admissions_path=Path(admissions_path) if admissions_path is not None else None,
+            allow_receipt_admissions=allow_receipt_admissions)
         for relation, values in admissions:
             facts.add(relation, values, source=source, depends_on=deps, kind="assumption")
         if source is not None and not any(r == "masked_difference_admitted" for r, _ in admissions):

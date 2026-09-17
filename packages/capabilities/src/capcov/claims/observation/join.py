@@ -38,14 +38,16 @@ built; Lane A has no such premise, and borrowing that framing would let a real
 finding read as "not built yet".
 
 THE THREE ROWS THE JUDGE ADDS, AND WHY THEY ARE NOT COPIED.
-``observation_source_observed`` is RECOMPUTED by ``build`` from the trees under
-judgment -- ``git rev-parse HEAD^{tree}`` in the candidate worktree and the
-digest of the prepared-runtime manifest -- and never lifted from the receipt: a
-receipt that binds itself would bind nothing.  A mismatch is a contract finding
-with status ``stale``, and the row is simply not emitted, so the claim fails at
-``observation_run_current`` and says why.  ``observation_nonce_observed`` takes
-its nonce from the reviewer (``nonce=``), not from the receipt, and a mismatch
-is likewise ``stale``.  ``observation_fixture_observed`` is the reviewer's
+``observation_source_observed`` is recomputed from the clean candidate Git
+checkout and the exact prepared-runtime manifest bytes, never lifted from the
+receipt.  The strict CLI additionally requires a pre-run external invocation
+record to pin the candidate and incumbent identities.  The CLI does not
+independently traverse or verify the incumbent runtime's complete source
+closure; the caller owns that preflight, while this check confirms the pinned
+identity and manifest bytes.  A mismatch is a contract finding with status
+``stale``, and the row is withheld.  ``observation_nonce_observed`` takes its
+nonce from the reviewer (``nonce=``), not from the receipt, and a mismatch is
+likewise ``stale``.  ``observation_fixture_observed`` is the reviewer's
 observation of the fixture digest.  ``fixture=True`` is the fixture-judging
 mode, for committed receipts with no tree to observe: the three rows are then
 taken from the receipt and the caveat is recorded in the summary, loudly,
@@ -68,11 +70,13 @@ from typing import Any
 
 from ..ir import (Atom, Bundle, Claim, Constant, Context, Evidence, canonical_json)
 from ..differential import CompiledKernelMismatch, DifferentialMismatch, compare, compare_three
+from ..differential import KernelReport, run_python
 from ..souffle import program_for_pack
 from ..souffle.compile import CompiledChecker, compile_program
 from ..static.combine import combine
 from .. import assumptions
 from ..static.ground import shared_assumptions, why, why_not
+from ..static.certificate import certify, claim_conclusions, recheck
 from . import observation_facts
 from .pack import pack_bundle
 
@@ -239,25 +243,32 @@ class SourceObservation:
     observed: str | None            # the recomputed source digest, when one was computed
     matches: bool
     detail: str
+    status: str = "unobserved"      # "verified" | "stale" | "unobserved" | "operational-failure"
 
 
 def observe_source(receipt: dict[str, Any], candidate_root: Path | None,
-                   incumbent_manifest: Path | None) -> SourceObservation:
+                   incumbent_manifest: Path | None, *,
+                   expected_incumbent_commit: str | None = None,
+                   expected_incumbent_runtime_commit: str | None = None,
+                   expected_manifest_sha256: str | None = None,
+                   expected_source_digest: str | None = None,
+                   expected_candidate_commit: str | None = None,
+                   expected_candidate_tree: str | None = None) -> SourceObservation:
     """Recompute ``sources.source_digest`` from the candidate tree and the manifest.
 
     The candidate half is observed: ``HEAD`` and ``HEAD^{tree}`` of the worktree
     the caller names, plus a clean-worktree check, because a digest over a dirty
-    tree names something nobody can check out again.  The incumbent half is the
-    digest of the prepared-runtime manifest file on disk.  The repo name and the
-    incumbent's two commits come from the receipt: they are what the receipt
-    *claims*, and the recomputation is what makes the claim checkable.
+    tree names something nobody can check out again. The incumbent half is the
+    exact prepared-runtime manifest bytes and commit identities supplied by the
+    caller's pre-run record. This function does not independently verify the
+    incumbent runtime's complete source closure; the caller owns that preflight.
     """
     declared = receipt["sources"]["source_digest"]
     if candidate_root is None or incumbent_manifest is None:
         return SourceObservation(
             "absent", None, False,
             "no candidate worktree and prepared-runtime manifest were given, so the receipt's "
-            "source digest was not observed in any tree")
+            "source digest was not observed in any tree", "unobserved")
     root, manifest = Path(candidate_root), Path(incumbent_manifest)
     try:
         dirty = bool(_git(root, "status", "--porcelain"))
@@ -265,32 +276,53 @@ def observe_source(receipt: dict[str, Any], candidate_root: Path | None,
         tree = _git(root, "rev-parse", "HEAD^{tree}")
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         return SourceObservation("tree", None, False,
-                                 f"the candidate worktree {str(root)!r} could not be read: {exc}")
+                                 f"the candidate worktree {str(root)!r} could not be read: {exc}",
+                                 "operational-failure")
     if dirty:
         return SourceObservation("tree", None, False,
                                  f"the candidate worktree {str(root)!r} is dirty; a source "
-                                 f"digest over a tree nobody can check out again binds nothing")
+                                 f"digest over a tree nobody can check out again binds nothing",
+                                 "stale")
     if not manifest.is_file():
         return SourceObservation("tree", None, False,
-                                 f"the prepared-runtime manifest {str(manifest)!r} is absent")
+                                 f"the prepared-runtime manifest {str(manifest)!r} is absent",
+                                 "operational-failure")
     manifest_sha = hashlib.sha256(manifest.read_bytes()).hexdigest()
     incumbent = receipt["sources"]["incumbent"]
+    # In strict live judging, the prepared invocation record supplies the
+    # incumbent identity. Receipt-local values remain only the compatibility
+    # default for old fixture callers and are never the CLI's authority.
+    incumbent_commit = expected_incumbent_commit or incumbent["commit"]
+    incumbent_runtime_commit = expected_incumbent_runtime_commit or incumbent["runtime_commit"]
     observed = hashlib.sha256(canonical_json({
         "candidate": {"repo": receipt["sources"]["candidate"]["repo"], "commit": commit,
                       "tree": tree},
-        "incumbent": {"commit": incumbent["commit"],
-                      "runtime_commit": incumbent["runtime_commit"],
+        "incumbent": {"commit": incumbent_commit,
+                      "runtime_commit": incumbent_runtime_commit,
                       "manifest_sha256": manifest_sha},
     }).encode("utf-8")).hexdigest()
-    if observed != declared:
+    if ((expected_manifest_sha256 is not None and manifest_sha != expected_manifest_sha256)
+            or observed != declared
+            or (expected_source_digest is not None and observed != expected_source_digest)
+            or (expected_incumbent_commit is not None
+                and incumbent["commit"] != expected_incumbent_commit)
+            or (expected_incumbent_runtime_commit is not None
+                and incumbent["runtime_commit"] != expected_incumbent_runtime_commit)
+            or (expected_candidate_commit is not None and commit != expected_candidate_commit)
+            or (expected_candidate_tree is not None and tree != expected_candidate_tree)
+            or receipt["sources"]["candidate"]["commit"] != commit
+            or receipt["sources"]["candidate"]["tree"] != tree):
         return SourceObservation(
             "tree", observed, False,
-            f"the receipt names source {declared[:12]} but the judged trees recompute to "
+            f"the receipt names source {declared[:12]} but the candidate checkout and "
+            f"prepared-runtime manifest recompute to "
             f"{observed[:12]} (candidate commit {commit[:12]}, tree {tree[:12]}, manifest "
-            f"{manifest_sha[:12]}); the receipt is not a receipt for this tree")
+            f"{manifest_sha[:12]}); the receipt is not a receipt for this tree", "stale")
     return SourceObservation("tree", observed, True,
-                             f"the judged trees recompute the receipt's source digest "
-                             f"{observed[:12]} (candidate commit {commit[:12]})")
+                             f"the candidate checkout and prepared-runtime manifest bytes "
+                             f"recompute the bound source digest {observed[:12]} "
+                             f"(candidate commit {commit[:12]}); incumbent runtime closure "
+                             "was not independently verified", "verified")
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +352,7 @@ class ObservationJoin:
     certificates: dict[str, dict[str, Any]] = field(default_factory=dict)
     row_certificates: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     invalidations: dict[str, assumptions.Invalidation] = field(default_factory=dict)
+    python_report: KernelReport | None = None
 
     def claim_id(self, kind: str) -> str:
         return f"claim-{kind}-{self.run}"
@@ -333,10 +366,14 @@ class ObservationJoin:
         return self.claim_id("incumbent-stable")
 
     def report(self):
+        if self.python_report is not None:
+            return self.python_report
         return self.result.python if self.result is not None else (
             self.mismatch.python if self.mismatch else None)
 
     def closures(self) -> list[Any]:
+        if self.python_report is not None:
+            return [self.python_report]
         if self.result is None:
             return []
         reports = [self.result.python, self.result.souffle]
@@ -357,7 +394,15 @@ class ObservationJoin:
 
 def build(directory: Path | str, *, candidate_root: Path | str | None = None,
           incumbent_manifest: Path | str | None = None, nonce: str | None = None,
-          fixture_digest: str | None = None, fixture: bool = False) -> ObservationJoin:
+          fixture_digest: str | None = None, fixture: bool = False,
+          allow_receipt_admissions: bool | None = None,
+          external_admissions_path: Path | str | None = None,
+          expected_incumbent_commit: str | None = None,
+          expected_incumbent_runtime_commit: str | None = None,
+          expected_manifest_sha256: str | None = None,
+          expected_source_digest: str | None = None,
+          expected_candidate_commit: str | None = None,
+          expected_candidate_tree: str | None = None) -> ObservationJoin:
     """Export the receipt, add the reviewer's three observations, state the two claims.
 
     ``candidate_root`` / ``incumbent_manifest`` are the trees under judgment.
@@ -369,9 +414,14 @@ def build(directory: Path | str, *, candidate_root: Path | str | None = None,
     to inspect and takes all three from the receipt, recording that it did.
     """
     directory = Path(directory)
+    if allow_receipt_admissions and not fixture:
+        raise ValueError("receipt-local admissions are available only in explicit fixture mode")
+    receipt_admissions = fixture if allow_receipt_admissions is None else allow_receipt_admissions
     receipt = json.loads((directory / observation_facts.RECEIPT_FILE).read_text(encoding="utf-8"))
     run = receipt.get("run", {}).get("id", "")
-    exported = observation_facts.export_bundle(directory, run=run or None)
+    exported = observation_facts.export_bundle(
+        directory, run=run or None, admissions_path=external_admissions_path,
+        allow_receipt_admissions=receipt_admissions and external_admissions_path is None)
     join = ObservationJoin(directory, receipt, run, exported)
     if exported.status != observation_facts.STATUS_COMPLETE:
         join.contract_findings = [f"exporter refused the receipt ({exported.status}): {m}"
@@ -416,9 +466,16 @@ def build(directory: Path | str, *, candidate_root: Path | str | None = None,
         observation = SourceObservation(
             "fixture", join.source_digest, True,
             "fixture mode: the receipt's source digest was taken from the receipt, not "
-            "observed in any tree, so source binding is ASSUMED here and not checked")
+            "observed in any tree, so source binding is ASSUMED here and not checked", "assumed")
     else:
-        observation = observe_source(receipt, candidate_root, incumbent_manifest)
+        observation = observe_source(
+            receipt, candidate_root, incumbent_manifest,
+            expected_incumbent_commit=expected_incumbent_commit,
+            expected_incumbent_runtime_commit=expected_incumbent_runtime_commit,
+            expected_manifest_sha256=expected_manifest_sha256,
+            expected_source_digest=expected_source_digest,
+            expected_candidate_commit=expected_candidate_commit,
+            expected_candidate_tree=expected_candidate_tree)
     join.source_observation = observation
     if observation.matches:
         additions.append(_fact(decls, "observation_source_observed",
@@ -430,7 +487,7 @@ def build(directory: Path | str, *, candidate_root: Path | str | None = None,
     else:
         # A mismatch is a contract finding with status ``stale``; an absent
         # observation is simply an absent premise.  Neither invents the row.
-        status = "stale" if observation.observed is not None else "unobserved"
+        status = observation.status
         join.contract_findings.append(f"{status}: {observation.detail}")
 
     # --- the fixture: the reviewer's observation -----------------------------
@@ -503,6 +560,40 @@ def evaluate_join(join: ObservationJoin, replay_root: str, *, kernels: str = "tw
         join.mismatch = exc.result
         return join
     join.certificates, join.row_certificates = assumptions.certify_claims(join.bundle, join.result)
+    return join
+
+
+def evaluate_python(join: ObservationJoin) -> ObservationJoin:
+    """Evaluate only the pure-Python kernel and recheck available certificates.
+
+    This is the live bridge's deliberately single-kernel report. It never
+    invents a second backend or calls a missing backend a disagreement.
+    """
+    if join.bundle is None:
+        return join
+    report = run_python(join.bundle)
+    join.python_report = report
+    if report.operational_failure is not None:
+        return join
+    try:
+        for claim in join.bundle.claims:
+            rows = claim_conclusions(join.bundle, report.relations, claim)
+            for row in rows:
+                certificate = certify(join.bundle, report.relations, claim.relation, row)
+                if certificate.get("truncated"):
+                    continue
+                checked = recheck(join.bundle, certificate, report.relations)
+                if not checked.ok:
+                    raise ValueError("certificate failed recheck")
+                join.certificates.setdefault(claim.id, certificate)
+                join.row_certificates.setdefault(claim.id, []).append(certificate)
+    except (AssertionError, RecursionError, TypeError, ValueError) as exc:
+        # A failed certificate check is an operational integrity error. Preserve
+        # the kernel's closure for diagnosis, but make it dominate any semantic
+        # answer in downstream reporting.
+        from dataclasses import replace
+        join.python_report = replace(report, operational_failure="certificate-invalid",
+                                     message=type(exc).__name__)
     return join
 
 
@@ -665,7 +756,10 @@ def summary(join: ObservationJoin) -> dict[str, Any]:
     agree = join.verdict(join.agree_claim) or {}
     stable = join.verdict(join.stable_claim) or {}
     blocking = blocking_premise(relations, join.run) if relations else None
-    if join.result is None and join.mismatch is None:
+    if join.python_report is not None:
+        status = ("operational-failure" if join.python_report.operational_failure
+                  else "complete")
+    elif join.result is None and join.mismatch is None:
         status = "not-evaluated"
     elif join.result is not None and join.result.matched:
         status = "complete"
@@ -686,7 +780,8 @@ def summary(join: ObservationJoin) -> dict[str, Any]:
         "observation_identity": dict(join.exported.bundle.metadata)["observation_digest"],
         "observation_bundle_digest": observation_facts.bundle_digest(join.exported.bundle),
         "combined_bundle_digest": observation_facts.bundle_digest(join.bundle),
-        "kernels": ["python", "souffle"] + (["souffle-compiled"] if join.kernels == "three" else []),
+        "kernels": (["python"] if join.python_report is not None else
+                    ["python", "souffle"] + (["souffle-compiled"] if join.kernels == "three" else [])),
         "contract_findings": list(join.contract_findings),
         "assumption_ids": list(join.assumption_ids),
         # 5.6: always printed, supported or not.
@@ -711,6 +806,8 @@ def summary(join: ObservationJoin) -> dict[str, Any]:
         "stability_rows": sorted([list(r[1:]) for r in relations.get("observation_stability", ())
                                   if r and r[0] == join.run], key=canonical_json),
     }
+    if join.python_report is not None and join.python_report.operational_failure:
+        out["operational_failure"] = join.python_report.operational_failure
     note = normalization_note(relations, join.run) if relations else None
     if note:
         out["normalization_note"] = note

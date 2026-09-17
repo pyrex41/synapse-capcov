@@ -25,6 +25,10 @@ from pathlib import Path
 from capcov.claims import canonical_json, validate_bundle
 from capcov.claims.observation import observation_facts as facts
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 FIXTURES = HERE / "fixtures"
 PACKAGE = HERE.parents[1] / "src" / "capcov" / "claims" / "observation"
@@ -93,14 +97,14 @@ class CommittedReceiptExportTest(unittest.TestCase):
     def test_all_four_export_complete_and_validate(self) -> None:
         for directory in ALL_FIXTURES:
             with self.subTest(directory.name):
-                result = facts.export_bundle(directory)
+                result = _export_fixture(directory)
                 self.assertEqual(result.status, facts.STATUS_COMPLETE,
                                  "; ".join(result.messages))
                 self.assertIsNotNone(result.bundle)
                 self.assertEqual(validate_bundle(result.bundle), ())
 
     def test_the_agreeing_receipt_exports_one_row_per_observation(self) -> None:
-        result = facts.export_bundle(AGREE)
+        result = _export_fixture(AGREE)
         counts = result.counts
         self.assertEqual(counts["observation_run"], 1)
         self.assertEqual(counts["observation_scenario"], SCENARIO_COUNT)
@@ -122,18 +126,18 @@ class CommittedReceiptExportTest(unittest.TestCase):
     def test_only_observe_and_reviewer_ever_appear_as_producers(self) -> None:
         for directory in ALL_FIXTURES:
             with self.subTest(directory.name):
-                bundle = facts.export_bundle(directory).bundle
+                bundle = _export_fixture(directory).bundle
                 classes = {record.source.split()[0] for record in bundle.evidence}
                 self.assertEqual(classes, {"observe", "reviewer"})
 
     def test_the_ledger_rows_are_assumptions_and_the_rest_are_facts(self) -> None:
-        bundle = facts.export_bundle(AGREE).bundle
+        bundle = _export_fixture(AGREE).bundle
         assumptions = {record.atom.relation for record in bundle.evidence
                        if record.kind == "assumption"}
         self.assertEqual(assumptions, {"policy_admitted", "scenario_set_admitted"})
 
     def test_the_gap_receipt_exports_the_unobserved_row_not_a_silence(self) -> None:
-        result = facts.export_bundle(GAP)
+        result = _export_fixture(GAP)
         self.assertEqual(result.status, facts.STATUS_COMPLETE)
         self.assertEqual(result.counts["observation_unobserved"], 1)
         self.assertEqual(result.counts["observation_observed"], SCENARIO_COUNT * 2 - 1)
@@ -143,39 +147,63 @@ class CommittedReceiptExportTest(unittest.TestCase):
                          ["project-malformed", "candidate", "timeout"])
 
     def test_the_masked_receipt_exports_the_difference_it_hid(self) -> None:
-        result = facts.export_bundle(MASKED)
+        result = _export_fixture(MASKED)
         self.assertEqual(result.status, facts.STATUS_COMPLETE)
         self.assertEqual(result.counts["observation_masked_difference"], 1)
         self.assertEqual(result.counts["observation_normalization"], 2)
         self.assertEqual(result.counts["observation_policy_entry"], 1)
 
     def test_identity_is_a_function_of_the_rows_not_of_where_they_were_read(self) -> None:
-        first = facts.export_bundle(AGREE)
+        first = _export_fixture(AGREE)
         with _Mutated(AGREE, lambda r: None) as elsewhere:
-            second = facts.export_bundle(elsewhere)
+            second = _export_fixture(elsewhere)
         self.assertEqual(dict(first.bundle.metadata)["observation_digest"],
                          dict(second.bundle.metadata)["observation_digest"])
         self.assertEqual(facts.bundle_digest(first.bundle),
                          facts.bundle_digest(second.bundle))
 
     def test_the_four_receipts_have_four_distinct_identities(self) -> None:
-        identities = {directory.name: dict(facts.export_bundle(directory).bundle.metadata)
+        identities = {directory.name: dict(_export_fixture(directory).bundle.metadata)
                       ["observation_digest"] for directory in ALL_FIXTURES}
         self.assertEqual(len(set(identities.values())), 4, identities)
 
-    def test_an_absent_log_is_recorded_and_never_read_as_a_pass(self) -> None:
+    def test_an_absent_required_log_refuses_the_receipt(self) -> None:
         with _Mutated(AGREE, lambda r: None) as root:
             (root / facts.LOG_FILE).unlink()
-            result = facts.export_bundle(root)
-        self.assertEqual(result.status, facts.STATUS_COMPLETE)
-        self.assertFalse(dict(result.bundle.metadata)["log"]["verified"])
-        self.assertTrue(any("was not verified against any bytes" in message
+            result = _export_fixture(root)
+        self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
+        self.assertIn("log.txt is absent", result.messages[0])
+
+    def test_receipt_local_admissions_are_ignored_by_default(self) -> None:
+        result = facts.export_bundle(AGREE)
+        self.assertEqual(result.status, facts.STATUS_COMPLETE, "; ".join(result.messages))
+        self.assertEqual(result.counts.get("policy_admitted", 0), 0)
+        self.assertEqual(result.counts.get("scenario_set_admitted", 0), 0)
+        self.assertTrue(any("external observation admission record absent" in message
                             for message in result.messages), result.messages)
+
+    def test_repeat_must_uniquely_cover_the_registered_set(self) -> None:
+        def partial(receipt: dict) -> None:
+            receipt["repeat"]["compared_scenarios"].pop()
+
+        with _Mutated(AGREE, partial) as root:
+            result = _export_fixture(root)
+        self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
+        self.assertIn("does not cover the admitted set", result.messages[0])
+
+    def test_repeat_duplicate_scenario_is_refused(self) -> None:
+        def duplicate(receipt: dict) -> None:
+            receipt["repeat"]["compared_scenarios"][0] = receipt["repeat"]["compared_scenarios"][1]
+
+        with _Mutated(AGREE, duplicate) as root:
+            result = _export_fixture(root)
+        self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
+        self.assertIn("contains a duplicate scenario", result.messages[0])
 
     def test_an_absent_ledger_withholds_the_admissions_rather_than_inventing_them(self) -> None:
         with _Mutated(AGREE, lambda r: None) as root:
             (root / facts.ADMISSIONS_FILE).unlink()
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_COMPLETE)
         self.assertNotIn("policy_admitted", result.counts)
         self.assertNotIn("scenario_set_admitted", result.counts)
@@ -186,12 +214,12 @@ class CommittedReceiptExportTest(unittest.TestCase):
             document["reviewed_against"]["policy"] = "0" * 64
 
         with _Mutated(AGREE, lambda r: None, ledger=other_policy) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_STALE)
         self.assertIn("is not a review of this receipt", result.messages[0])
 
     def test_a_receipt_for_another_run_is_refused(self) -> None:
-        result = facts.export_bundle(AGREE, run="0" * 16)
+        result = _export_fixture(AGREE, run="0" * 16)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertIn("caller asked for", result.messages[0])
 
@@ -207,7 +235,7 @@ class NonconformingReceiptExample(unittest.TestCase):
     def _refuse(self, mutate, expected: str, *, source: Path = AGREE, forbidden=None) -> None:
         with _Mutated(source, mutate) as root:
             kwargs = {} if forbidden is None else {"forbidden_strings": forbidden}
-            result = facts.export_bundle(root, **kwargs)
+            result = _export_fixture(root, **kwargs)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT)
         self.assertEqual(result.messages, (expected,))
         self.assertIsNone(result.bundle)

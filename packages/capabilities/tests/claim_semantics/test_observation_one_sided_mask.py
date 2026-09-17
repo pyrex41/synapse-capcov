@@ -46,6 +46,10 @@ from capcov.claims.static.combine import combine
 from capcov.claims.observation import observation_facts as facts
 from capcov.claims.observation import join as observation_join
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 AGREE = HERE / "fixtures" / "observation_receipt_agree"
 
@@ -166,7 +170,7 @@ class OneSidedMaskTest(unittest.TestCase):
 
     def test_the_undisclosed_one_sided_mask_is_refused_at_export(self) -> None:
         with _Variant(disclose=False) as root:
-            result = facts.export_bundle(root)
+            result = _export_fixture(root)
         self.assertEqual(result.status, facts.STATUS_INVALID_INPUT,
                          f"the false green: the exporter returned {result.status!r} for a "
                          f"receipt whose only normalization fired on one side and erased a "

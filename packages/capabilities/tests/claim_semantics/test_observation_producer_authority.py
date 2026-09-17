@@ -32,6 +32,10 @@ from capcov.claims.static.combine import combine
 from capcov.claims.observation import observation_facts as facts
 from capcov.claims.observation.pack import load_pack, pack_bundle
 
+
+def _export_fixture(*args, **kwargs):
+    return facts.export_bundle(*args, allow_receipt_admissions=True, **kwargs)
+
 HERE = Path(__file__).resolve().parent
 AGREE = HERE / "fixtures" / "observation_receipt_agree"
 
@@ -84,10 +88,10 @@ class LedgerProducerTest(unittest.TestCase):
             document["producer"] = producer
             path.write_text(json.dumps(document, indent=1, sort_keys=True) + "\n",
                             encoding="utf-8")
-            return facts.export_bundle(root)
+            return _export_fixture(root)
 
     def test_the_committed_ledger_is_accepted(self) -> None:
-        result = facts.export_bundle(AGREE)
+        result = _export_fixture(AGREE)
         self.assertEqual(result.status, facts.STATUS_COMPLETE)
         assert_valid(result.bundle)
 
@@ -115,7 +119,7 @@ class HarnessMaySignNoReviewerRowTest(unittest.TestCase):
 
     @staticmethod
     def _joined(source: str):
-        exported = facts.export_bundle(AGREE)
+        exported = _export_fixture(AGREE)
         pack = pack_bundle()
         decls = {decl.name: decl for decl in (*exported.bundle.relations, *pack.relations)}
         decl = decls["observation_nonce_observed"]
