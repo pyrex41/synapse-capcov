@@ -353,18 +353,38 @@ def judge_receipt(receipt_dir: Path, out_dir: Path, required: list[str], *,
         diagnostics.append(f"kernels disagree on a certified claim row: {exc}")
         return document, diagnostics
     if join.mismatch is not None:
-        document = judge_document(join, required, verdict=VERDICT_KERNEL_MISMATCH,
-                                  exit_code=EXIT_KERNEL, program_digest=program_digest,
-                                  findings=join.contract_findings)
-        write_json(out_dir / JUDGE_FILE, document)
         failures = {report.backend: report.operational_failure
                     for report in (getattr(join.mismatch, "reports", None) or ())
                     if report.operational_failure}
+        # A kernel that could not be started did not disagree with anything: the
+        # interpreter is absent, or is here and would not run.  `require_evaluators`
+        # catches the absent case before any work, so what reaches here is a
+        # souffle that exists and failed -- exit 4's question, not exit 2's.
+        # Calling it a disagreement would report a differential that never ran.
+        unavailable = sorted(name for name, failure in failures.items()
+                             if failure == "souffle-unavailable")
+        verdict = VERDICT_UNAVAILABLE if unavailable else VERDICT_KERNEL_MISMATCH
+        document = judge_document(join, required, verdict=verdict,
+                                  exit_code=(EXIT_UNAVAILABLE if unavailable else EXIT_KERNEL),
+                                  program_digest=program_digest,
+                                  findings=join.contract_findings)
+        if unavailable:
+            document["message"] = (
+                f"{', '.join(unavailable)} could not be started: "
+                + "; ".join(str(failures[name]) for name in unavailable)
+            )
+        write_json(out_dir / JUDGE_FILE, document)
         ran = ", ".join(getattr(join.mismatch, "evaluators", ()) or join.evaluators)
-        diagnostics.append(
-            (f"a claim kernel failed ({'; '.join(f'{k}: {v}' for k, v in sorted(failures.items()))})"
-             if failures else f"claim kernels disagree ({ran})")
-            + "; the receipt is not judged")
+        if unavailable:
+            diagnostics.append(
+                f"toolchain unavailable: the {', '.join(unavailable)} kernel could not run, "
+                f"so no differential ran; the receipt is not judged")
+        else:
+            diagnostics.append(
+                (f"a claim kernel failed "
+                 f"({'; '.join(f'{k}: {v}' for k, v in sorted(failures.items()))})"
+                 if failures else f"claim kernels disagree ({ran})")
+                + "; the receipt is not judged")
         return document, diagnostics
     replay_join.write_artifacts(join, out_dir)
     document = judge_document(join, required, verdict=VERDICT_SUPPORTED, exit_code=EXIT_OK,

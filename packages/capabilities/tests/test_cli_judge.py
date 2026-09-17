@@ -897,6 +897,17 @@ class _StubDisagreement:
     reports = (_StubReport("python", "a" * 64), _StubReport("souffle", "b" * 64))
 
 
+def _stub_kernel_failure(failure: str):
+    """The same shape, but the second kernel never ran: it failed by name."""
+    broken = _StubReport("souffle", "")
+    broken.operational_failure = failure
+
+    class _Failed(_StubDisagreement):
+        reports = (_StubReport("python", "a" * 64), broken)
+
+    return _Failed
+
+
 class KernelDisagreementIsExitTwoTests(unittest.TestCase):
     """Kernels that disagree are exit 2 and no verdict -- and the gate fails.
 
@@ -925,6 +936,15 @@ class KernelDisagreementIsExitTwoTests(unittest.TestCase):
         claims_judge.replay_join.evaluate_join = disagree
         self.addCleanup(setattr, claims_judge.replay_join, "evaluate_join", original)
 
+    def _patch(self, outcome) -> None:
+        """Re-point the injection at another disagreement shape."""
+        def disagree(join, *args, **kwargs):
+            join.result, join.mismatch = None, outcome()
+            join.evaluators, join.differential = outcome.evaluators, "ran"
+            return join
+
+        self.judge.replay_join.evaluate_join = disagree
+
     def test_the_judge_reports_kernel_mismatch_exit_two_and_judges_no_op(self) -> None:
         out = self.tmp / "mismatch"
         document, diagnostics = self.judge.judge_receipt(MIN_RECEIPT, out, [])
@@ -935,6 +955,31 @@ class KernelDisagreementIsExitTwoTests(unittest.TestCase):
         self.assertTrue(any("kernels disagree" in line for line in diagnostics), diagnostics)
         self.assertEqual(json.loads((out / "judge.json").read_text())["exit_code"],
                          self.judge.EXIT_KERNEL)
+
+    def test_a_souffle_that_will_not_start_is_unavailable_not_a_disagreement(self) -> None:
+        """Exit 4's question, not exit 2's: nothing disagreed, a kernel never ran.
+
+        `require_evaluators` refuses an ABSENT souffle before any work; what
+        reaches the differential is a souffle that is here and will not run, and
+        reporting that as "the kernels disagree" claims a differential that never
+        happened (with a digest for a closure nothing produced).
+        """
+        self._patch(_stub_kernel_failure("souffle-unavailable"))
+        out = self.tmp / "unavailable"
+        # the ask stays the default python kernel -- the injected outcome is what
+        # carries the failed souffle, so this needs no interpreter to be here
+        document, diagnostics = self.judge.judge_receipt(MIN_RECEIPT, out, [])
+        self.assertEqual(document["verdict"], self.judge.VERDICT_UNAVAILABLE)
+        self.assertEqual(document["exit_code"], self.judge.EXIT_UNAVAILABLE)
+        self.assertIn("could not be started", document["message"])
+        self.assertTrue(any("no differential ran" in line for line in diagnostics), diagnostics)
+
+    def test_a_kernel_that_failed_some_other_way_is_still_a_kernel_failure(self) -> None:
+        """Only "could not be started" is the toolchain's; the rest stay exit 2."""
+        self._patch(_stub_kernel_failure("souffle-execution-failed"))
+        document, _ = self.judge.judge_receipt(MIN_RECEIPT, self.tmp / "failed", [])
+        self.assertEqual(document["verdict"], self.judge.VERDICT_KERNEL_MISMATCH)
+        self.assertEqual(document["exit_code"], self.judge.EXIT_KERNEL)
 
     def test_the_cli_fails_the_gate_and_never_passes_it(self) -> None:
         """Even over an artifact whose own gate passes: the judge reached no verdict."""
