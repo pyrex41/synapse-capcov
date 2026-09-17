@@ -11,10 +11,11 @@ witness are labelled *assumptions* (``Evidence.kind == "assumption"``, ids
 ``<prefix>:assumed:...``) under a synthetic index digest; their sources name
 the class the schema requires and say they are reviewer assumptions.
 
-``evaluate_join`` runs the fail-closed differential -- two kernels (python and
-interpreted Souffle) or, with ``kernels="three"``, the compiled Souffle
-checker as well -- and certifies every claim row from every closure; the
-certificates must be identical across kernels.  ``summary`` is what the static
+``evaluate_join`` runs the evaluators the caller asked for -- the stdlib python
+kernel alone by default, ``evaluators="all"`` for every one whose tool is
+present -- and certifies every claim row from every closure; the certificates
+must be identical across every kernel that ran, and with two or more of them the
+fail-closed differential decides.  ``summary`` is what the static
 pilot records under ``replay_join``; ``write_artifacts`` writes digests,
 counts, verdicts and certificates only (no source text, no local paths).
 
@@ -29,11 +30,12 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..ir import (Atom, Bundle, Claim, Constant, Context, DiagnosticRule, Evidence, OutputTemplate,
                   TemplateValue, Variable, canonical_json)
-from ..differential import CompiledKernelMismatch, DifferentialMismatch, compare, compare_three
+from ..differential import (CompiledKernelMismatch, DifferentialMismatch, EvaluatorMismatch,
+                            EVALUATORS, resolve_evaluators, run_evaluators, souffle_executable)
 from ..souffle import program_for_pack
 from ..souffle.compile import CompiledChecker, compile_program
 from ..static.combine import combine
@@ -269,7 +271,11 @@ class ReplayJoin:
     mismatch: Any = None
     """The disagreeing result when they do not."""
     kernels: str = "two"
-    """``"two"`` (python, souffle) or ``"three"`` (plus souffle-compiled)."""
+    """``"one"``, ``"two"`` or ``"three"``: how many evaluators ``evaluators`` names."""
+    evaluators: tuple[str, ...] = ()
+    """The evaluators that ran, in ``differential.EVALUATORS`` order; empty before evaluation."""
+    differential: str | None = None
+    """``"ran"`` or ``"not-run (single evaluator)"``; ``None`` before evaluation."""
     checker: CompiledChecker | None = None
     """The compiled checker the three-kernel evaluation ran, for provenance."""
     certificates: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -287,16 +293,29 @@ class ReplayJoin:
         return f"claim-{kind}-{op}"
 
     def report(self):
-        return self.result.python if self.result is not None else (self.mismatch.python if self.mismatch else None)
+        """The closure the summary reads: the first evaluator that ran, python when it did.
+
+        Every evaluator that ran was held to the same claim rows and the same
+        certificates, so which one is read is arbitrary -- but it must exist,
+        and with a python-only ask the Souffle report does not.
+        """
+        outcome = self.result if self.result is not None else self.mismatch
+        if outcome is None:
+            return None
+        reports = getattr(outcome, "reports", None)
+        if reports:
+            return reports[0]
+        return outcome.python
 
     def closures(self) -> list[Any]:
-        """Every agreeing kernel's report, python first."""
+        """Every agreeing kernel's report, in ``differential.EVALUATORS`` order."""
         if self.result is None:
             return []
-        reports = [self.result.python, self.result.souffle]
-        if getattr(self.result, "compiled", None) is not None:
-            reports.append(self.result.compiled)
-        return reports
+        reports = getattr(self.result, "reports", None)
+        if reports is not None:
+            return list(reports)
+        reports = [self.result.python, self.result.souffle, getattr(self.result, "compiled", None)]
+        return [report for report in reports if report is not None]
 
     def verdict(self, claim_id: str) -> dict[str, Any] | None:
         report = self.report()
@@ -309,8 +328,36 @@ class ReplayJoin:
                 "missing_premises": list(claim.missing_premises)}
 
 
+def _receipt_header(directory: Path) -> dict[str, Any]:
+    """The receipt this join is about, or a contract finding naming what is wrong.
+
+    ``build`` needs ``run`` before the exporter can be asked for anything (it is
+    asked to export *that* run), so the keys the join itself indexes are checked
+    here, by name.  Without this a JSON document that is not a replay receipt --
+    the judge's own output document, which is also called ``receipt.json`` -- got
+    as far as ``receipt["run"]`` and left the CLI with a ``KeyError`` traceback
+    instead of a finding about the evidence.
+    """
+    path = directory / replay_facts.RECEIPT_FILE
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise replay_facts.ExportInputError(
+            f"{replay_facts.RECEIPT_FILE}: not valid JSON ({exc})") from exc
+    if not isinstance(receipt, dict):
+        raise replay_facts.ExportInputError(
+            f"{replay_facts.RECEIPT_FILE}: must be an object")
+    for key in ("run", "nonce", "snapshot"):
+        value = receipt.get(key)
+        if not isinstance(value, str) or not value:
+            raise replay_facts.ExportInputError(
+                f"{replay_facts.RECEIPT_FILE}: {key!r} must be a non-empty string; "
+                f"{str(directory)!r} is not a replay receipt directory")
+    return receipt
+
+
 def build(directory: Path, *, reviewer_admissions=()) -> ReplayJoin:
-    receipt = json.loads((directory / replay_facts.RECEIPT_FILE).read_text(encoding="utf-8"))
+    receipt = _receipt_header(directory)
     run = receipt["run"]
     exported = replay_facts.export_bundle(
         directory, run=run, reviewer_admissions=reviewer_admissions)
@@ -443,39 +490,55 @@ def build(directory: Path, *, reviewer_admissions=()) -> ReplayJoin:
     return join
 
 
-def evaluate_join(join: ReplayJoin, replay_root: str, *, kernels: str = "two",
-                  checker: CompiledChecker | None = None, cache_dir: str | Path = ".capcov/compiled",
-                  executable: str = "souffle") -> ReplayJoin:
-    """Run the kernels and certify every claim row from every closure.
+#: ``kernels=`` in words, kept for the callers that named a count rather than a set.
+KERNEL_SETS = {"one": ("python",), "two": ("python", "souffle"), "three": EVALUATORS}
+_KERNEL_WORDS = {1: "one", 2: "two", 3: "three"}
 
-    ``kernels="two"`` is the pairwise differential (python vs interpreted
-    Souffle, with its shrinker); ``kernels="three"`` adds the compiled Souffle
-    checker (``checker``, or compiled into ``cache_dir`` from the bundle's
-    fact-independent program) through ``compare_three``.  In either mode the
-    claim rows, the certificates and the rechecks must agree across every
-    closure; a kernel disagreement is recorded on ``join.mismatch`` and
-    nothing is certified.
+
+def evaluate_join(join: ReplayJoin, replay_root: str, *, kernels: str | None = None,
+                  evaluators: Sequence[str] | str | None = None,
+                  checker: CompiledChecker | None = None, cache_dir: str | Path = ".capcov/compiled",
+                  executable: str | None = None) -> ReplayJoin:
+    """Run the requested evaluators and certify every claim row from every closure.
+
+    ``evaluators`` names them (a sequence, a comma list, or ``"all"`` for every
+    evaluator whose tool is present) and **defaults to the stdlib kernel alone**,
+    so a join needs no optional tool unless one was asked for.  ``kernels=``
+    remains for the callers that named a count: ``"two"`` is python + the Souffle
+    interpreter (``compare`` and its shrinker), ``"three"`` adds the compiled
+    checker (``compare_three``); it is an error to pass both.
+
+    Whatever ran, the claim rows, the certificates and the rechecks must agree
+    across every closure; a disagreement is recorded on ``join.mismatch`` and
+    nothing is certified.  With a single evaluator there is nothing to disagree
+    with, which ``join.differential`` states in words rather than letting a
+    reader infer a differential from a match.
     """
     if join.bundle is None:
         return join
-    if kernels not in ("two", "three"):
-        raise ValueError("kernels must be 'two' or 'three'")
-    join.kernels = kernels
-    if kernels == "three" and checker is None:
+    if kernels is not None and evaluators is not None:
+        raise ValueError("pass kernels= or evaluators=, not both")
+    if kernels is not None:
+        if kernels not in KERNEL_SETS:
+            raise ValueError("kernels must be 'one', 'two' or 'three'")
+        names = KERNEL_SETS[kernels]
+    else:
+        names = resolve_evaluators(evaluators, executable=executable)
+    join.evaluators = names
+    join.kernels = _KERNEL_WORDS[len(names)]
+    if "souffle-compiled" in names and checker is None:
         # compile up front so the provenance of the binary that judged the
         # receipt is recorded even when the caller did not supply a checker
-        checker = compile_program(program_for_pack(join.bundle), executable=executable,
-                                  cache_dir=cache_dir)
+        checker = compile_program(program_for_pack(join.bundle),
+                                  executable=souffle_executable(executable), cache_dir=cache_dir)
     join.checker = checker
     try:
-        if kernels == "two":
-            join.result = compare(join.bundle, replay_root=replay_root)
-        else:
-            join.result = compare_three(join.bundle, checker=checker, replay_root=replay_root,
-                                        cache_dir=cache_dir, executable=executable)
-    except (DifferentialMismatch, CompiledKernelMismatch) as exc:
+        join.result = run_evaluators(join.bundle, names, checker=checker, replay_root=replay_root,
+                                     cache_dir=cache_dir, executable=executable)
+    except (DifferentialMismatch, CompiledKernelMismatch, EvaluatorMismatch) as exc:
         join.mismatch = exc.result
         return join
+    join.differential = join.result.differential
     join.certificates, join.row_certificates = assumptions.certify_claims(join.bundle, join.result)
     return join
 
@@ -525,7 +588,7 @@ def invalidate(join: ReplayJoin, identifier: str, replay_root: str) -> assumptio
     result = assumptions.invalidate(
         join.bundle, identifier, replay_root=replay_root,
         baseline_result=join.result, baseline_row_certificates=join.row_certificates,
-        explain=_explain(join))
+        explain=_explain(join), evaluators=join.evaluators)
     join.invalidations[result.assumption_id] = result
     return result
 
@@ -542,7 +605,8 @@ def summary(join: ReplayJoin) -> dict[str, Any]:
         "replay_bundle_digest": replay_facts.bundle_digest(join.exported.bundle),
         "combined_bundle_digest": replay_facts.bundle_digest(join.bundle),
         "model_absent": join.model_absent,
-        "kernels": ["python", "souffle"] + (["souffle-compiled"] if join.kernels == "three" else []),
+        "kernels": list(join.evaluators),
+        "differential": join.differential,
         "synthetic_index": SYNTHETIC_INDEX,
         "assumption_ids": list(join.assumption_ids),
         "ops": list(join.ops),
@@ -638,15 +702,25 @@ def summary(join: ReplayJoin) -> dict[str, Any]:
 
 
 def _kernel_digests(join: ReplayJoin) -> dict[str, Any]:
+    """One canonical digest per evaluator that ran, plus whether they agreed.
+
+    An evaluator that was not asked for has no digest here rather than a null:
+    the key names the kernel that produced the bytes, so inventing one for a
+    kernel that did not run would put a claim in the artifact nobody made.
+    """
     outcome = join.result if join.result is not None else join.mismatch
     digests: dict[str, Any] = {
         "matched": join.result is not None and join.result.matched,
-        "python_digest": outcome.python.canonical_digest,
-        "souffle_digest": outcome.souffle.canonical_digest,
+        "differential": getattr(outcome, "differential", None),
+        "evaluators": list(getattr(outcome, "evaluators", ()) or join.evaluators),
     }
-    compiled = getattr(outcome, "compiled", None)
-    if compiled is not None:
-        digests["compiled_digest"] = compiled.canonical_digest
+    for name, key in (("python", "python_digest"), ("souffle", "souffle_digest"),
+                      ("souffle-compiled", "compiled_digest")):
+        report = (outcome.report_for(name) if hasattr(outcome, "report_for")
+                  else getattr(outcome, "compiled" if name == "souffle-compiled" else name, None))
+        if report is not None:
+            digests[key] = report.canonical_digest
+    if getattr(outcome, "closure_digest_equal", None) is not None:
         digests["closure_digest_equal"] = outcome.closure_digest_equal
     return digests
 
@@ -711,7 +785,7 @@ def write_artifacts(join: ReplayJoin, out_dir: Path) -> dict[str, Any]:
 __all__ = ["SYNTHETIC_INDEX", "REVIEWER_SOURCE", "CENSUS_ASSUMPTION_SOURCE", "INDEX_ASSUMPTION_SOURCE",
            "MODEL_WITNESSES", "REASONS", "UNDECLARED_REASON", "PENDING_PREMISES",
            "QUALIFICATION_QUALIFIED", "QUALIFICATION_UNSUPPORTED", "qualification",
-           "ReplayJoin", "build", "evaluate_join",
+           "ReplayJoin", "build", "evaluate_join", "KERNEL_SETS",
            "summary", "write_artifacts", "blocking_premise", "undeclared_tables", "exclusions",
            "exclusions_applied", "well_formed_certificate", "learn_summary", "LEARN_UNMODELED_REASON",
            "assumption_registry", "invalidate"]

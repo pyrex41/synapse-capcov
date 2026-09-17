@@ -122,6 +122,18 @@ def _souffle() -> None:
         raise unittest.SkipTest("souffle must be on PATH: run inside the nix devShell")
 
 
+def _stand_in(python, souffle, matched: bool):
+    """An ``EvaluationResult``-shaped stand-in for the tests that poison a kernel.
+
+    ``reports`` is what the evaluator-aware code reads (``_closures``,
+    ``_primary``, ``_kernel_reports``); ``python``/``souffle`` are kept because
+    these tests name the kernel they doctored.
+    """
+    return SimpleNamespace(reports=(python, souffle), python=python, souffle=souffle,
+                           matched=matched, differential="ran",
+                           evaluators=("python", "souffle"))
+
+
 class _EvaluatedFixture(unittest.TestCase):
     """One evaluated baseline join, shared by every case (both kernels run once)."""
 
@@ -137,7 +149,9 @@ class _EvaluatedFixture(unittest.TestCase):
         cls.join = replay_join.build(receipt, reviewer_admissions=_synthetic_admissions(receipt))
         if cls.join.bundle is None:
             raise AssertionError("CONTRACT FINDING: " + "; ".join(cls.join.contract_findings))
-        replay_join.evaluate_join(cls.join, cls.replay_root)
+        # both kernels, named: the evaluator set is chosen, never detected, and
+        # this class is the one that reads a souffle_digest out of an A3 document
+        replay_join.evaluate_join(cls.join, cls.replay_root, evaluators="python,souffle")
         if cls.join.mismatch is not None:
             raise AssertionError(f"kernels disagree; replay bundle: {cls.join.mismatch.replay_path}")
         cls.registry = replay_join.assumption_registry(cls.join)
@@ -535,7 +549,7 @@ class UnreferencedAssumptionTest(unittest.TestCase):
             cls.directory, reviewer_admissions=_synthetic_admissions(cls.directory))
         if cls.join.bundle is None:
             raise AssertionError("CONTRACT FINDING: " + "; ".join(cls.join.contract_findings))
-        replay_join.evaluate_join(cls.join, cls.replay_root)
+        replay_join.evaluate_join(cls.join, cls.replay_root, evaluators="python,souffle")
         if cls.join.mismatch is not None:
             raise AssertionError(f"kernels disagree; replay bundle: {cls.join.mismatch.replay_path}")
         cls.registry = replay_join.assumption_registry(cls.join)
@@ -638,29 +652,28 @@ class RefusalTest(_EvaluatedFixture):
         operation unusable on any bundle that already carries a refuted claim,
         which is exactly the bundle an invalidation is most worth asking about.
         """
-        real_compare = assumptions.compare
+        real_run = assumptions.run_evaluators
 
         def mask(report):
             claims = [SimpleNamespace(key=c.key, semantic="refuted" if c.key == CONSTRAINS else c.semantic,
                                       operational=c.operational, missing_premises=c.missing_premises)
                       for c in report.claims]
-            return SimpleNamespace(claims=claims, relations=report.relations,
+            return SimpleNamespace(backend=report.backend, claims=claims, relations=report.relations,
                                    canonical_digest=report.canonical_digest)
 
-        def poisoned(bundle, **kwargs):
-            result = real_compare(bundle, **kwargs)
-            return SimpleNamespace(python=mask(result.python), souffle=result.souffle,
-                                   matched=result.matched)
+        def poisoned(bundle, evaluators, **kwargs):
+            result = real_run(bundle, evaluators, **kwargs)
+            return _stand_in(mask(result.python), result.souffle, result.matched)
 
-        baseline = SimpleNamespace(python=mask(self.join.result.python),
-                                   souffle=self.join.result.souffle, matched=True)
-        assumptions.compare = poisoned
+        baseline = _stand_in(mask(self.join.result.python), self.join.result.souffle, True)
+        assumptions.run_evaluators = poisoned
         try:
             result = assumptions.invalidate(self.join.bundle, PINNED_EXCLUSION_IDS["redis"],
                                             replay_root=self.replay_root, baseline_result=baseline,
-                                            baseline_row_certificates=self.join.row_certificates)
+                                            baseline_row_certificates=self.join.row_certificates,
+                                            evaluators=self.join.evaluators)
         finally:
-            assumptions.compare = real_compare
+            assumptions.run_evaluators = real_run
         entry = result.claims[CONSTRAINS]
         self.assertEqual(entry["before"]["semantic"], "refuted")
         self.assertEqual(entry["after"]["semantic"], "refuted")
@@ -703,23 +716,23 @@ class RefusalTest(_EvaluatedFixture):
 
     def test_transition_to_refuted_is_a_finding(self) -> None:
         """If a kernel ever reported refuted after a drop, no document is written."""
-        real_compare = assumptions.compare
+        real_run = assumptions.run_evaluators
 
-        def poisoned(bundle, **kwargs):
-            result = real_compare(bundle, **kwargs)
+        def poisoned(bundle, evaluators, **kwargs):
+            result = real_run(bundle, evaluators, **kwargs)
             claims = [SimpleNamespace(key=c.key, semantic="refuted" if c.key == QUALIFIED else c.semantic,
                                       operational=c.operational, missing_premises=c.missing_premises)
                       for c in result.python.claims]
-            python = SimpleNamespace(claims=claims, relations=result.python.relations,
+            python = SimpleNamespace(backend="python", claims=claims, relations=result.python.relations,
                                      canonical_digest=result.python.canonical_digest)
-            return SimpleNamespace(python=python, souffle=result.souffle, matched=result.matched)
+            return _stand_in(python, result.souffle, result.matched)
 
-        assumptions.compare = poisoned
+        assumptions.run_evaluators = poisoned
         try:
             with self.assertRaises(InvalidationError) as caught:
                 replay_join.invalidate(self.join, PINNED_EXCLUSION_IDS["go_issue_outbox"], self.replay_root)
         finally:
-            assumptions.compare = real_compare
+            assumptions.run_evaluators = real_run
         self.assertIn("never a refutation", str(caught.exception))
         self.assertNotIn(PINNED_EXCLUSION_IDS["go_issue_outbox"], self.join.invalidations)
 
