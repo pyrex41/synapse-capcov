@@ -680,6 +680,7 @@ def summary(join: ReplayJoin) -> dict[str, Any]:
             entry["qualified_under_exclusions"] = (f"qualified under {len(applied)} reviewer exclusions: "
                                                    + ", ".join(applied))
         out[op] = entry
+    scoped_ops = set(join.ops)
     out["exclusions"] = exclusions(relations, join.run) if relations else []
     # Global structure and per-operation checker evidence stay separate.
     out["model_well_formed"] = well_formed_certificate(relations, join.run) if relations else "missing"
@@ -689,7 +690,7 @@ def summary(join: ReplayJoin) -> dict[str, Any]:
             [{"operation": r[1], "checker": r[2], "version": r[3],
               "binary": r[4], "certificate": r[5]}
              for r in relations.get("model_operation_checked", ())
-             if r[0] in models and r[1] in ops], key=canonical_json)
+             if r[0] in models and r[1] in scoped_ops], key=canonical_json)
     else:
         out["model_operation_checked"] = []
     out["learn"] = learn_summary(relations, join.run) if relations else {"present": False}

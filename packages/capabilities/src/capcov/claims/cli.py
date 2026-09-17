@@ -638,8 +638,6 @@ def main(argv: list[str]) -> int:
         return _assumptions(args)
     if args.tool == "modelcheck":
         return _modelcheck(args)
-    if args.tool == "jev":
-        return _jev(args)
     if args.tool == "static":
         return _static(args)
 
