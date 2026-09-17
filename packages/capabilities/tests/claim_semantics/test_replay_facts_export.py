@@ -942,7 +942,12 @@ class ModelWellFormedTest(_Exported):
                          "ignored receipt-local authority must not affect identity")
 
     def test_placeholder_external_reviewers_contribute_no_admission(self) -> None:
-        for reviewer in sorted(replay_facts.UNSIGNED_REVIEWERS - {""}) + ["Unassigned", "  TBD  "]:
+        placeholders = [
+            "unassigned", "unsigned", "none", "nobody", "tbd", "pending", "placeholder",
+            "TBD pending", "  [TBD pending]  ", "ＴＢＤ pending", "placeholder-reviewer",
+            "Placeholder_Reviewer", "none yet", "NONE—yet",
+        ]
+        for reviewer in placeholders:
             with self.subTest(reviewer=reviewer):
                 result = self.export(reviewer_admissions=[
                     self.admission(producer=f"reviewer {reviewer}")])
@@ -950,6 +955,14 @@ class ModelWellFormedTest(_Exported):
                 self.assertEqual(_rows(result.bundle, "model_checker_admitted"), [])
                 self.assertTrue(any("placeholder" in message and "contributes no authority" in message
                                     for message in result.messages), result.messages)
+
+    def test_placeholder_words_inside_names_are_not_substring_matches(self) -> None:
+        for reviewer in ("Tbderson", "Placeholderly", "Pendington", "Nonesuch"):
+            with self.subTest(reviewer=reviewer):
+                result = self.export(reviewer_admissions=[
+                    self.admission(producer=f"reviewer {reviewer}")])
+                self.assertEqual(result.status, replay_facts.STATUS_COMPLETE, result.messages)
+                self.assertEqual(len(_rows(result.bundle, "model_checker_admitted")), 1)
 
     def test_the_model_host_may_not_certify_its_own_model(self) -> None:
         for producer in ("shen shen-model-host v1", "reviewer fixture-reviewer", "replay fg-replay v1"):

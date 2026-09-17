@@ -303,6 +303,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -415,8 +416,18 @@ _REVIEWER_ADMISSION_KEYS = frozenset({
     "producer", "model", "operation", "checker", "checker_version",
     "checker_binary", "certificate",
 })
-UNSIGNED_REVIEWERS = frozenset({"unassigned", "unsigned", "none", "nobody", "tbd", "placeholder", ""})
+UNSIGNED_REVIEWER_TOKENS = frozenset({
+    "unassigned", "unsigned", "none", "nobody", "tbd", "pending", "placeholder",
+})
+_REVIEWER_NAME_TOKEN_RE = re.compile(r"[^\W_]+", re.UNICODE)
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _reviewer_name_is_placeholder(name: str) -> bool:
+    """Reject reserved placeholder words without matching inside real names."""
+    normalized = unicodedata.normalize("NFKC", name).casefold()
+    tokens = _REVIEWER_NAME_TOKEN_RE.findall(normalized)
+    return not tokens or bool(UNSIGNED_REVIEWER_TOKENS.intersection(tokens))
 
 # The learn campaign (module docstring, LEARN RECEIPT).  A subdirectory, because the
 # learn files are a *different producer chain* -- a tape generator, the oracle and the
@@ -986,7 +997,7 @@ def _validated_reviewer_admissions(
             raise ExportInputError(f"{label}.producer: must use the reviewer producer class")
         producer_parts = values["producer"].split(None, 1)
         reviewer = producer_parts[1].strip() if len(producer_parts) == 2 else ""
-        if reviewer.lower() in UNSIGNED_REVIEWERS:
+        if _reviewer_name_is_placeholder(reviewer):
             messages.append(
                 f"{label}: reviewer is {reviewer!r}, a placeholder; this admission contributes no authority")
             continue
