@@ -406,7 +406,7 @@ class CheckerTest(unittest.TestCase):
         self.assertEqual(bad.returncode, 0, bad.stderr[-500:])
         document = json.loads(bad.stdout)
         self.assertEqual(document["verdict"], "well-formed")
-        self.assertEqual([j["id"] for j in document["judgements"] if j["verdict"] == "fail"], ["atlas:delete-issue"])
+        self.assertEqual([failure["id"] for failure in document["failures"]], ["atlas:delete-issue"])
         self.assertIsNotNone(document["fact"])
         missing = subprocess.run([sys.executable, "-m", "capcov", "experiment", "claims", "modelcheck", "--model",
                                   tempfile.mkdtemp(prefix="capcov-no-model-")], capture_output=True, text=True, env=env, timeout=600)
@@ -429,6 +429,37 @@ class PreflightTest(unittest.TestCase):
         report = modelcheck.preflight(tempfile.mkdtemp(prefix="capcov-no-model-"))
         self.assertIn(report["status"], ("failed", "unavailable"))
         self.assertIsNone(report["fact"])
+
+    def test_claims_cli_maps_preflight_statuses_without_fabricating_a_fact(self) -> None:
+        from capcov.claims import cli as claims_cli
+
+        cases = (
+            ({"status": "well-formed", "model": "a" * 64,
+              "fact": {"run": "run-1"}, "certificate_sha256": "b" * 64,
+              "failures": [], "error": None}, 0, "well-formed"),
+            ({"status": "ill-formed", "model": "a" * 64, "fact": None,
+              "certificate_sha256": "b" * 64, "failures": [{"id": "registry-ids",
+              "message": "type mismatch"}], "error": None}, 1, "ill-formed"),
+            ({"status": "unavailable", "model": None, "fact": None,
+              "certificate_sha256": None, "failures": [], "error": "pinned runtime missing"},
+             3, "modelcheck-unavailable"),
+            ({"status": "failed", "model": None, "fact": None,
+              "certificate_sha256": None, "failures": [], "error": "not a model"},
+             3, "modelcheck-failure"),
+        )
+        for report, expected_status, expected_document in cases:
+            with self.subTest(preflight=report["status"]):
+                with unittest.mock.patch.object(modelcheck, "preflight", return_value=report), \
+                        unittest.mock.patch.object(claims_cli, "_emit") as emit:
+                    status = claims_cli.main(["claims", "modelcheck", "--model", "/model"])
+                self.assertEqual(status, expected_status)
+                document = emit.call_args.args[0]
+                if report["status"] in {"well-formed", "ill-formed"}:
+                    self.assertEqual(document["verdict"], expected_document)
+                    self.assertEqual(document["fact"], report["fact"])
+                else:
+                    self.assertEqual(document["operational_failure"], expected_document)
+                    self.assertEqual(document["error"], report["error"])
 
     @unittest.skipIf(RUNTIME_REASON, RUNTIME_REASON or "")
     def test_verdicts_carry_the_fact_only_when_well_formed(self) -> None:

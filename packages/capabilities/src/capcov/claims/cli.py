@@ -528,24 +528,37 @@ def _modelcheck(args) -> int:
     except _ProfileUnavailable as exc:
         _emit({"operational_failure": "profile-unavailable", "error": str(exc)}, None)
         return 3
-    try:
-        result = modelcheck.check(args.model, out_dir=args.out, timeout=args.timeout, keep=args.keep)
-    except modelcheck.ModelcheckUnavailable:
-        _emit({"operational_failure": "modelcheck-unavailable",
-               "error": "the pinned model-checker runtime is unavailable"}, None)
+    if args.keep:
+        # Preserve the explicit scratch-directory debugging mode.  The normal
+        # producer-profile path uses preflight below, which has a stable
+        # never-raises contract for callers that are gating a command.
+        try:
+            result = modelcheck.check(args.model, out_dir=args.out,
+                                      timeout=args.timeout, keep=True)
+        except modelcheck.ModelcheckUnavailable as exc:
+            _emit({"operational_failure": "modelcheck-unavailable", "error": str(exc)}, None)
+            return 3
+        except modelcheck.ModelcheckFailure as exc:
+            _emit({"operational_failure": "modelcheck-failure", "error": str(exc)}, None)
+            return 3
+        report = {"status": result.status, "model": result.model_digest,
+                  "fact": result.fact["rows"][0] if result.fact else None,
+                  "certificate_sha256": result.certificate["certificate_sha256"],
+                  "failures": [{"id": j.id, "message": j.message} for j in result.failures],
+                  "error": None, "workdir_retained": result.workdir is not None}
+    else:
+        report = modelcheck.preflight(args.model, out_dir=args.out, timeout=args.timeout)
+    if report["status"] in {"unavailable", "failed"}:
+        failure = "modelcheck-unavailable" if report["status"] == "unavailable" else "modelcheck-failure"
+        _emit({"operational_failure": failure, "error": report["error"]}, None)
         return 3
-    except modelcheck.ModelcheckFailure:
-        _emit({"operational_failure": "modelcheck-failure",
-               "error": "the model-checker refused its input or execution"}, None)
-        return 3
-    document = {"verdict": result.status, "model": result.model_digest,
-                "judgements": [{"id": j.id, "verdict": j.verdict, "message": j.message} for j in result.judgements],
-                "skipped": [{"op": op, "reason": reason} for op, reason in result.skipped],
-                "certificate_sha256": result.certificate["certificate_sha256"],
-                "fact": result.fact, "workdir_retained": result.workdir is not None,
-                "elapsed_seconds": round(result.elapsed_seconds, 3)}
+    document = {"verdict": report["status"], "model": report["model"],
+                "failures": list(report["failures"]),
+                "certificate_sha256": report["certificate_sha256"],
+                "fact": report["fact"],
+                "workdir_retained": bool(report.get("workdir_retained", False))}
     _emit(document, None)
-    return 0 if result.status == "well-formed" else 1
+    return 0 if report["status"] == "well-formed" else 1
 
 
 def main(argv: list[str]) -> int:

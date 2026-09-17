@@ -62,6 +62,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 SRC = PACKAGE_ROOT / "src"
@@ -220,19 +221,29 @@ class ExperimentNamespaceIsLazyTests(unittest.TestCase):
         self.assertIn("LOADED []", proc.stdout, proc.stdout + proc.stderr)
 
     def test_the_advisory_profile_answers_by_name_when_it_is_not_here(self) -> None:
-        """A missing optional profile is a named refusal, never an ImportError."""
-        proc = _capcov("experiment", "claims", "jev")
-        self.assertNotIn("Traceback", proc.stderr)
+        """A valid advisory subcommand names a missing optional module, without eager imports."""
+        script = (
+            "import importlib\n"
+            "from capcov.claims import cli\n"
+            "original = importlib.import_module\n"
+            "def unavailable(name, package=None):\n"
+            "    if name == 'capcov.claims.jev':\n"
+            "        raise ModuleNotFoundError('simulated absent Jev profile')\n"
+            "    return original(name, package)\n"
+            "importlib.import_module = unavailable\n"
+            "try:\n"
+            "    status = cli.main(['claims', 'jev', 'assess', '--request', '/unused/request.json'])\n"
+            "finally:\n"
+            "    importlib.import_module = original\n"
+            "assert status == 3\n"
+        )
+        proc = subprocess.run([sys.executable, "-c", script], text=True,
+                              capture_output=True, env=_env())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         document = json.loads(proc.stdout)
-        if document.get("operational_failure") == "profile-unavailable":
-            self.assertEqual(proc.returncode, 3, proc.stdout)
-            self.assertTrue(document["advisory"])
-            self.assertIn("capcov.claims.jev", document["error"])
-        else:
-            # the module is part of this checkout: then the key gates it, and the
-            # advisory profile still never raises
-            self.assertIn(document.get("operational_failure"),
-                          (None, "jev-unavailable"), document)
+        self.assertEqual(document.get("operational_failure"), "profile-unavailable")
+        self.assertTrue(document["advisory"])
+        self.assertIn("capcov.claims.jev", document["error"])
 
 
 class JudgeUsageRefusalTests(unittest.TestCase):
@@ -665,6 +676,55 @@ class ModelProfileAbsentToolIsNamedTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("--model shen needs shen-go", proc.stderr)
         self.assertFalse(coverage.exists())
+
+
+class ModelProfilePreflightBoundaryTests(unittest.TestCase):
+    """The explicit producer flag runs preflight before judging; no runtime is built here."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-model-boundary-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_model_flag_preflights_ill_formed_and_unavailable_results(self) -> None:
+        from capcov import cli as capcov_cli
+        from capcov.claims import modelcheck
+        from capcov.claims.replay import judge as claims_judge
+
+        cases = (
+            ({"status": "ill-formed", "model": "a" * 64, "fact": None,
+              "certificate_sha256": "b" * 64,
+              "failures": [{"id": "registry-ids", "message": "type mismatch"}],
+              "error": None}, 0, True),
+            ({"status": "unavailable", "model": None, "fact": None,
+              "certificate_sha256": None, "failures": [], "error": "mock runtime unavailable"},
+             1, False),
+        )
+        for report, expected_status, should_judge in cases:
+            with self.subTest(status=report["status"]):
+                receipt = _copy_receipt(self.tmp / report["status"], strip_models=True)
+                out = self.tmp / f"{report['status']}-judge"
+                judge_document = {"verdict": "supported", "exit_code": 0,
+                                  "ops": {}, "kernels": ["python"],
+                                  "differential": "not-run (single evaluator)",
+                                  "compiled": None, "differential_report": None,
+                                  "contract_findings": []}
+                with patch("capcov.cli._require_shen_go", return_value="/mock/shen"), \
+                        patch.object(modelcheck, "preflight", return_value=report) as preflight, \
+                        patch.object(claims_judge, "judge_receipt",
+                                     return_value=(judge_document, [])) as judge:
+                    status = capcov_cli.main([
+                        "gate", str(PYTHON_APP / "coverage.json"),
+                        "--exemptions", str(EXEMPTIONS), "--judge", "claims",
+                        "--receipt", str(receipt), "--judge-out", str(out),
+                        "--model", f"shen:{MODEL_MIN}", "--quiet"])
+                self.assertEqual(status, expected_status)
+                preflight.assert_called_once_with(MODEL_MIN, out_dir=receipt)
+                self.assertEqual(judge.called, should_judge)
+                self.assertFalse((receipt / "model_well_formed.json").exists())
+                if should_judge:
+                    self.assertTrue((out / "judge.json").is_file())
+                else:
+                    self.assertFalse(out.exists())
 
 
 class NoModelProfileJudgesWhatTheReceiptCarriesTests(unittest.TestCase):
