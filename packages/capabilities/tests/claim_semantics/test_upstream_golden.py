@@ -46,6 +46,9 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 GOLDEN = Path(__file__).resolve().parent / "fixtures" / "upstream_golden"
 GENERATE = GOLDEN / "generate.py"
 NORMALIZE = GOLDEN / "normalize.py"
+#: The fixture's own metadata, by path from the golden root: what records
+#: the run rather than being part of it.  Not basenames -- see
+#: `_relative_golden_files`.
 META = {"README.md", "MANIFEST.json", "generate.py", "normalize.py"}
 # the two commands that gained the opt-in --judge flags; pinned by their own test
 HELP_WITH_JUDGE = {"cli/help_reconcile.stdout", "cli/help_gate.stdout"}
@@ -140,10 +143,14 @@ class UpstreamGoldenTests(unittest.TestCase):
         this test does not re-run; it is pinned by the manifest below like
         everything else, and excluded only from the artifact comparisons.
         """
-        return sorted(
-            str(path.relative_to(GOLDEN)) for path in GOLDEN.rglob("*")
-            if path.is_file() and path.name not in META
-            and not str(path.relative_to(GOLDEN)).startswith("suite/"))
+        names = (str(path.relative_to(GOLDEN))
+                 for path in GOLDEN.rglob("*") if path.is_file())
+        # META is matched on the RELATIVE PATH, not the basename: the four
+        # metadata files live at the root of the fixture, and a recorded
+        # artifact that happens to be called README.md or generate.py inside
+        # `python_app/` is an artifact and must be compared like one.
+        return sorted(name for name in names
+                      if name not in META and not name.startswith("suite/"))
 
     def test_the_golden_bytes_are_the_ones_the_manifest_names(self) -> None:
         """Prove the comparison below read upstream's committed bytes, not a re-baseline.
@@ -166,6 +173,22 @@ class UpstreamGoldenTests(unittest.TestCase):
         self.assertEqual(set(self._relative_golden_files()) - set(manifest), set())
         self.assertEqual(set(manifest) - present, set(),
                          "the manifest names a file this tree does not have")
+
+    def test_only_the_root_metadata_and_the_suite_record_are_excluded(self) -> None:
+        """Nothing leaves the byte comparison by accident of its basename.
+
+        `META` names four files at the root of the fixture.  Matching it on the
+        basename instead would silently drop any recorded artifact called
+        README.md, MANIFEST.json, generate.py or normalize.py from a
+        subdirectory -- a real possibility for a fixture whose whole content is
+        CLI output over sample projects.  This pins the exclusion set to exactly
+        the four root files plus the `suite/` record.
+        """
+        everything = {str(path.relative_to(GOLDEN))
+                      for path in GOLDEN.rglob("*") if path.is_file()}
+        excluded = everything - set(self._relative_golden_files())
+        self.assertEqual({name for name in excluded if not name.startswith("suite/")},
+                         META)
 
     def test_every_default_path_artifact_is_byte_identical_to_upstream(self) -> None:
         differing, missing = [], []
