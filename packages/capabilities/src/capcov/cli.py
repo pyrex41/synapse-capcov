@@ -542,7 +542,13 @@ class _JudgeUsage(Exception):
     """
 
 
-def _judge_block() -> dict:
+#: capcov.toml paths this process has already said it could not read, so the
+#: line below is written once per file however many `[judge]` keys are looked up
+#: over it (engine, evaluator and model are three separate lookups of one file).
+_JUDGE_BLOCK_UNREADABLE: set[str] = set()
+
+
+def _judge_block(command: str) -> dict:
     """The working directory's ``[judge]`` table, or an empty one.
 
     `reconcile` and `gate` take artifact paths rather than a project root, so the
@@ -550,6 +556,16 @@ def _judge_block() -> dict:
     to.  Neither command read capcov.toml before these flags existed, so a file
     that cannot be read or parsed must not turn a working default run into a
     failure: it is passed over and the defaults stand.
+
+    Passed over, but never in silence.  A team that opted in with ``[judge]
+    engine = "claims"`` and later broke an unrelated line of that same file would
+    otherwise get the four-cell gate's usual PASS and nothing anywhere saying the
+    judge they believe is gating did not run -- "a flag that silently does
+    nothing is how a gate goes green for the wrong reason", moved into the config
+    file.  So the fallback keeps the exit code and the stdout it always had and
+    names itself on **stderr**: one line saying which file could not be parsed,
+    why, and what is deciding instead.  A missing capcov.toml and a well-formed
+    one are untouched -- neither reaches this branch.
     """
     config = Path("capcov.toml")
     if not config.exists():
@@ -558,7 +574,16 @@ def _judge_block() -> dict:
 
     try:
         data = tomllib.loads(config.read_text())
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        key = str(config.resolve())
+        if key not in _JUDGE_BLOCK_UNREADABLE:
+            _JUDGE_BLOCK_UNREADABLE.add(key)
+            print(
+                f"capcov {command}: {config} could not be parsed ({error}); no "
+                f"[judge] key is read from it, so the judge is whatever --judge "
+                f"names, or {JUDGE_DEFAULT} when it names nothing",
+                file=sys.stderr,
+            )
         return {}
     block = data.get("judge", {})
     return block if isinstance(block, dict) else {}
@@ -576,7 +601,7 @@ def _judge_engine(args: argparse.Namespace, command: str) -> str:
     source = "--judge"
     if engine is None:
         config = Path("capcov.toml")
-        engine = _judge_block().get("engine")
+        engine = _judge_block(command).get("engine")
         source = f"[judge] engine in {config}"
     if engine is None:
         return JUDGE_DEFAULT
@@ -607,7 +632,7 @@ def _judge_evaluators(args: argparse.Namespace, command: str) -> tuple[str, ...]
     value = getattr(args, "evaluator", None)
     source = "--evaluator"
     if value is None:
-        value = _judge_block().get("evaluator")
+        value = _judge_block(command).get("evaluator")
         source = "[judge] evaluator in capcov.toml"
     if value is None:
         value = JUDGE_EVALUATOR_DEFAULT
@@ -683,7 +708,7 @@ def _judge_model(args: argparse.Namespace, command: str) -> tuple[str, Path, str
     value = getattr(args, "model", None)
     source = "--model"
     if value is None:
-        value = _judge_block().get("model")
+        value = _judge_block(command).get("model")
         source = "[judge] model in capcov.toml"
     if value is None:
         return None

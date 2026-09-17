@@ -297,6 +297,17 @@ directory that is not there, or a `--receipt`/`--judge-out`/`--evaluator`/
 the mistake, and judge nothing. A flag that silently did nothing is how a gate ends
 up green for the wrong reason.
 
+The same rule covers the config file. `reconcile` and `gate` never read
+`capcov.toml` before these flags existed, so one that cannot be parsed still
+must not turn a working default run into a failure — it is passed over, the exit
+code and stdout are the ones it always had, and the defaults stand. But it is
+not passed over in silence: a single line on **stderr** names the file, the
+parse error and what is deciding instead, because a project that opted in with
+`[judge] engine = "claims"` and later broke an unrelated line of that same file
+would otherwise get the four-cell gate's usual PASS with nothing anywhere saying
+the judge it believes is gating never ran. A well-formed `capcov.toml`, and no
+`capcov.toml` at all, are untouched — neither reaches that branch.
+
 Flow coverage retains the source obligation denominator and checks observed
 outcomes against a reviewed behavior model:
 

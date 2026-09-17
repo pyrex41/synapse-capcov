@@ -335,6 +335,38 @@ class DefaultJudgeIsTodaysBehaviorTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("capcov gate: FAIL -- 4 unexplained", proc.stdout)
 
+    def test_a_capcov_toml_that_does_not_parse_says_so_on_stderr(self) -> None:
+        """Passed over, but not in silence.
+
+        A team that opted in with `[judge] engine = "claims"` and then broke an
+        unrelated line of that same file would otherwise see the four-cell
+        gate's usual output and nothing at all saying the judge they believe is
+        gating never ran.  The exit code and stdout above are unchanged; this is
+        the one line that says which file could not be read and what decided.
+        """
+        (self.tmp / "capcov.toml").write_text("this is not = = toml\n")
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), cwd=self.tmp)
+        self.assertIn("capcov.toml could not be parsed", proc.stderr)
+        self.assertIn("four-cell", proc.stderr)
+        # a note about the config, never a verdict: stdout is the gate's alone
+        self.assertNotIn("could not be parsed", proc.stdout)
+
+    def test_the_unreadable_config_is_named_once_however_many_keys_are_read(self) -> None:
+        """`engine`, `evaluator` and `model` are three lookups of one file."""
+        (self.tmp / "capcov.toml").write_text("this is not = = toml\n")
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(self.tmp / "out"),
+                       cwd=self.tmp, env=_env(PATH=""))
+        self.assertEqual(proc.stderr.count("could not be parsed"), 1, proc.stderr)
+
+    def test_a_readable_capcov_toml_says_nothing_about_parsing(self) -> None:
+        """The two paths every default run actually takes stay silent."""
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), cwd=self.tmp)
+        self.assertNotIn("could not be parsed", proc.stderr)
+        (self.tmp / "capcov.toml").write_text('[capcov]\nadapter = "python"\n')
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), cwd=self.tmp)
+        self.assertNotIn("could not be parsed", proc.stderr)
+
     def test_an_explicit_flag_is_never_lost_to_an_unreadable_capcov_toml(self) -> None:
         (self.tmp / "capcov.toml").write_text("this is not = = toml\n")
         proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
