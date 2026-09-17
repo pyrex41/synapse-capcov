@@ -2,7 +2,7 @@
 
 The replay judge signs every qualified verdict against a *model digest* and
 requires, as a positive premise, that the model at that digest is well
-formed: ``model_well_formed(model, checker, checker_version, certificate)``
+formed: ``model_well_formed(model, checker, checker_version, binary, certificate)``
 from producer class ``modelcheck`` (``schema_replay_v1``).  This module is that
 producer.  It does not judge replays and it does not trust the model host.
 
@@ -27,8 +27,10 @@ prints ``MC PASS <id> verified``.  The judgements:
   registry:<id>   [Id Op Rule RuleIndex Endpoints Reach Witness] : wf-registry
   registry-ids    [Id ...] : id-list
 
-Only ops with an as-is target on some live witness get ``writes``/``matrix``
-judgements; the others are reported as skipped, never presumed.
+``model_well_formed`` is a structural result: it covers the model load closure
+and global registry identity. Operation judgements are separate. An operation
+gets a positive checked row only when its complete local judgement set passes;
+an unchecked or failing operation cannot inherit another operation's result.
 
 The certificate binds the model digest (sha256 over the ``.shen`` sources in
 ``load.shen`` order, the model's own recipe), every source's sha256, the exact
@@ -62,7 +64,7 @@ from typing import Any
 from .ir import canonical_json
 
 CHECKER = "capcov-modelcheck"
-CHECKER_VERSION = "1.0.0"
+CHECKER_VERSION = "1.2.0"
 CERTIFICATE_KIND = "capcov-modelcheck-certificate-v1"
 PRODUCER_CLASS = "modelcheck"
 IMPL = "shen-go"
@@ -75,6 +77,46 @@ JUDGES = ("judge-writes", "judge-matrix", "judge-atlas", "judge-registry", "judg
 PRELUDE = "prelude.shen"
 
 _LOAD_LINE = re.compile(r'^\(load "([^"]+)"\)\s*$')
+_FORBIDDEN_RUNTIME_SYMBOL = re.compile(
+    r'(?<![A-Za-z0-9_.-])(load|eval|read-file)(?![A-Za-z0-9_.-])')
+
+
+def _shen_executable_surface(text: str) -> str:
+    """Blank strings and block comments, preserving executable token boundaries."""
+    out: list[str] = []
+    index = 0
+    comment = False
+    string = False
+    while index < len(text):
+        if comment:
+            if text.startswith("*\\", index):
+                out.extend("  ")
+                index += 2
+                comment = False
+            else:
+                out.append("\n" if text[index] == "\n" else " ")
+                index += 1
+            continue
+        if string:
+            out.append("\n" if text[index] == "\n" else " ")
+            if text[index] == '"':
+                string = False
+            index += 1
+            continue
+        if text.startswith("\\*", index):
+            out.extend("  ")
+            index += 2
+            comment = True
+        elif text[index] == '"':
+            out.append(" ")
+            index += 1
+            string = True
+        else:
+            out.append(text[index])
+            index += 1
+    if comment or string:
+        raise ModelcheckFailure("model source contains an unterminated comment or string")
+    return "".join(out)
 
 
 class ModelcheckUnavailable(RuntimeError):
@@ -100,7 +142,13 @@ class Runtime:
         return {"impl": IMPL,
                 "bifrost_sha256": self.bifrost_sha256,
                 "shen_go_sha256": self.shen_go_sha256,
+                "checker_binary": self.checker_binary,
                 "invocation": ["bifrost", "run", "--impl", IMPL, "--raw", "<driver.shen>"]}
+
+    @property
+    def checker_binary(self) -> str:
+        """Digest of the resolved native Shen checker executable itself."""
+        return self.shen_go_sha256
 
 
 @dataclass(frozen=True)
@@ -204,6 +252,12 @@ def model_files(model_dir: str | os.PathLike[str]) -> list[str]:
             candidate.resolve(strict=True).relative_to(root)
         except ValueError as exc:
             raise ModelcheckFailure("model source resolves outside the model directory") from exc
+        executable = _shen_executable_surface(candidate.read_text(encoding="utf-8"))
+        forbidden = _FORBIDDEN_RUNTIME_SYMBOL.search(executable)
+        if relative != "shen/load.shen" and forbidden:
+            raise ModelcheckFailure(
+                f"model source {relative} uses forbidden runtime symbol {forbidden.group(1)!r}; "
+                "all executable sources must be named by shen/load.shen")
     return files
 
 
@@ -231,6 +285,40 @@ def _source_files() -> list[str]:
     return [PRELUDE, *(f"types/{name}.shen" for name in DATATYPES), *(f"types/{name}.shen" for name in JUDGES)]
 
 
+_NATIVE_EXECUTABLE_MAGICS = {
+    b"\x7fELF",                    # ELF
+    b"\xfe\xed\xfa\xce",          # Mach-O 32-bit, big endian
+    b"\xce\xfa\xed\xfe",          # Mach-O 32-bit, little endian
+    b"\xfe\xed\xfa\xcf",          # Mach-O 64-bit, big endian
+    b"\xcf\xfa\xed\xfe",          # Mach-O 64-bit, little endian
+    b"\xca\xfe\xba\xbe",          # Mach-O universal 32-bit
+    b"\xbe\xba\xfe\xca",          # Mach-O universal 32-bit, swapped
+    b"\xca\xfe\xba\xbf",          # Mach-O universal 64-bit
+    b"\xbf\xba\xfe\xca",          # Mach-O universal 64-bit, swapped
+    b"MZ\x90\x00",                  # PE/COFF
+}
+
+
+def _resolve_native_executable(path: str, *, setting: str) -> tuple[str, str]:
+    """Hash the resolved native executable, never an executable shell wrapper."""
+    try:
+        resolved = Path(path).resolve(strict=True)
+    except OSError as exc:
+        raise ModelcheckUnavailable(f"{setting}={path!r} cannot be resolved to an executable") from exc
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise ModelcheckUnavailable(f"{setting}={path!r} does not resolve to an executable file")
+    try:
+        with resolved.open("rb") as handle:
+            magic = handle.read(4)
+    except OSError as exc:
+        raise ModelcheckUnavailable(f"{setting}={path!r} cannot be read") from exc
+    if magic not in _NATIVE_EXECUTABLE_MAGICS:
+        raise ModelcheckUnavailable(
+            f"{setting}={path!r} is not a recognized native executable; name the actual pinned "
+            "shen-go binary, not a shell or script launcher")
+    return str(resolved), _sha256_file(resolved)
+
+
 def runtime() -> Runtime:
     """Resolve the pinned runtime and the checker sources, or raise; never fall back."""
     bifrost = shutil.which("bifrost")
@@ -239,8 +327,7 @@ def runtime() -> Runtime:
     shen_go = os.environ.get("BIFROST_SHEN_GO", "")
     if not shen_go:
         raise ModelcheckUnavailable("BIFROST_SHEN_GO is not set; the pinned shen-go binary must be named explicitly")
-    if not (os.path.isfile(shen_go) and os.access(shen_go, os.X_OK)):
-        raise ModelcheckUnavailable(f"BIFROST_SHEN_GO={shen_go!r} is not an executable file")
+    shen_go, shen_go_sha256 = _resolve_native_executable(shen_go, setting="BIFROST_SHEN_GO")
     directory = modelcheck_dir()
     sources = []
     for relative in _source_files():
@@ -248,7 +335,7 @@ def runtime() -> Runtime:
         if not path.is_file():
             raise ModelcheckUnavailable(f"checker source {path} is missing")
         sources.append((relative, _sha256_file(path)))
-    return Runtime(bifrost, _sha256_file(bifrost), shen_go, _sha256_file(shen_go), str(directory), tuple(sources))
+    return Runtime(bifrost, _sha256_file(bifrost), shen_go, shen_go_sha256, str(directory), tuple(sources))
 
 
 # ---------------------------------------------------------------------------
@@ -270,13 +357,15 @@ def render_driver(model_dir: Path, workdir: Path, checker_dir: Path, protocol_no
     types = checker_dir / "types"
     lines = [
         "(tc -)",
-        f'(cd "{model}/")',
-        '(load "shen/load.shen")',
-        '(cd "")',
-        # Load the checker after the untrusted model so model definitions cannot
-        # replace mc.* protocol or judgement helpers.
+        # The checker owns model loading so every transitive source is reported.
         f'(load "{_shen_path(checker_dir / PRELUDE)}")',
         f'(output "MC {protocol_nonce} BEGIN~%")',
+        f'(cd "{model}/")',
+        '(mc.quiet-load "shen/load.shen")',
+        '(cd "")',
+        # Restore checker definitions after the untrusted model so it cannot
+        # replace mc.* protocol or judgement helpers.
+        f'(load "{_shen_path(checker_dir / PRELUDE)}")',
         f'(set mc.units (mc.reify "{gen}/"))',
         "(tc +)",
         *(f'(load "{_shen_path(types / (name + ".shen"))}")' for name in (*DATATYPES, *JUDGES)),
@@ -386,6 +475,7 @@ def _validate_shen_literal(text: str, unit_id: str) -> None:
 
 def _parse_transcript(stdout: str, protocol_nonce: str) -> dict[str, Any]:
     loaded: list[str] = []
+    operations: list[str] = []
     skipped: list[tuple[str, str]] = []
     units: dict[str, str] = {}
     judges: list[str] = []
@@ -396,7 +486,7 @@ def _parse_transcript(stdout: str, protocol_nonce: str) -> dict[str, Any]:
     prefix = f"MC {protocol_nonce} "
     begin = prefix + "BEGIN"
     protocol_line = re.compile(
-        rf"^{re.escape(prefix)}(LOADED|SKIP|UNIT|JUDGE|PASS|FAIL|DONE) ?(.*)$")
+        rf"^{re.escape(prefix)}(LOADED|OP|SKIP|UNIT|JUDGE|PASS|FAIL|DONE) ?(.*)$")
     for raw in stdout.splitlines():
         line = raw.rstrip()
         if not active:
@@ -411,6 +501,10 @@ def _parse_transcript(stdout: str, protocol_nonce: str) -> dict[str, Any]:
         kind, rest = match.group(1), match.group(2)
         if kind == "LOADED":
             loaded.append(rest)
+        elif kind == "OP":
+            if not _ATOM.fullmatch(rest) or rest in operations:
+                raise ModelcheckFailure("operation inventory is empty or contains duplicates")
+            operations.append(rest)
         elif kind == "SKIP":
             op, _, reason = rest.partition(" ")
             skipped.append((op, reason))
@@ -440,7 +534,8 @@ def _parse_transcript(stdout: str, protocol_nonce: str) -> dict[str, Any]:
         raise ModelcheckFailure(f"judgement functions loaded do not match the checker's: {judges}")
     if stray_errors:
         raise ModelcheckFailure("runtime errors outside the judgement protocol: " + " | ".join(stray_errors[:3]))
-    return {"loaded": loaded, "skipped": skipped, "units": units, "verdicts": verdicts}
+    return {"loaded": loaded, "operations": operations, "skipped": skipped,
+            "units": units, "verdicts": verdicts}
 
 
 # ---------------------------------------------------------------------------
@@ -458,8 +553,13 @@ def certificate_digest(certificate: dict[str, Any]) -> str:
 _REPRODUCTION_FIELDS = (
     "kind", "checker", "checker_version", "verdict", "model",
     "model_digest_recipe", "model_files", "runtime", "checker_sources",
-    "judgements", "skipped",
+    "judgements", "skipped", "operations",
 )
+
+
+def semantic_certificate_digest(payload: dict[str, Any]) -> str:
+    """Hash deterministic meaning, never run-envelope or elapsed-time fields."""
+    return _sha256_bytes(canonical_json(payload).encode("utf-8"))
 
 
 def _reproduction_projection(certificate: dict[str, Any]) -> dict[str, Any]:
@@ -471,7 +571,7 @@ def _fact_from_checked_certificate(certificate: dict[str, Any]) -> dict[str, Any
     """The ``model_well_formed.json`` receipt file the replay exporter reads
     (replay_facts, MODEL WELL-FORMEDNESS).  Only a well-formed verdict has one."""
     if certificate.get("verdict") != "well-formed":
-        raise ModelcheckFailure("only a well-formed verdict yields a model_well_formed fact")
+        raise ModelcheckFailure("only a structurally well-formed model yields a model_well_formed fact")
     if (certificate.get("checker") != CHECKER
             or certificate.get("checker_version") != CHECKER_VERSION):
         raise ModelcheckFailure("certificate does not name this checker and version")
@@ -482,11 +582,62 @@ def _fact_from_checked_certificate(certificate: dict[str, Any]) -> dict[str, Any
         int(model, 16)
     except ValueError as exc:
         raise ModelcheckFailure("certificate model is not a sha256 digest") from exc
+    binary = certificate["runtime"]["checker_binary"]
+    structural = [entry for entry in certificate["judgements"] if entry["id"] == "registry-ids"]
+    semantic = semantic_certificate_digest({
+        "model": model, "checker": CHECKER, "checker_version": CHECKER_VERSION,
+        "checker_binary": binary,
+        "checker_launcher_sha256": certificate["runtime"]["bifrost_sha256"],
+        "checker_sources": certificate["checker_sources"],
+        "judgements": [{k: j[k] for k in ("id", "verdict", "unit_sha256", "text")}
+                       for j in structural],
+    })
     return {
         "producer": f"{PRODUCER_CLASS} {CHECKER} {CHECKER_VERSION} model:{model[:12]}",
         "rows": [{"model": model, "checker": CHECKER, "checker_version": CHECKER_VERSION,
-                  "certificate": certificate["certificate_sha256"]}],
+                  "checker_binary": binary, "certificate": semantic}],
     }
+
+
+_ATOM = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:/?+\-]*$")
+
+
+def _registry_operation(text: str) -> str | None:
+    """Read the operation atom from a checker-emitted registry literal."""
+    match = re.search(r"mc\.judge-registry\s+\[\s*([^\s\[\]]+)\s+([^\s\[\]]+)", text)
+    if not match or not _ATOM.fullmatch(match.group(2)):
+        return None
+    return match.group(2)
+
+
+def _operation_facts(certificate: dict[str, Any]) -> dict[str, Any]:
+    """Return exact successful operation check rows from this checker result."""
+    judgements = certificate["judgements"]
+    by_id = {entry["id"]: entry for entry in judgements}
+    rows = []
+    identity = {
+        "checker": certificate["checker"],
+        "checker_version": certificate["checker_version"],
+        "checker_binary": certificate["runtime"]["checker_binary"],
+    }
+    for operation in certificate["operations"]:
+        required = [f"writes:{operation}", f"matrix:{operation}", f"atlas:{operation}"]
+        local_ids = [j["id"] for j in judgements
+                     if j["id"].startswith("registry:") and _registry_operation(j["text"]) == operation]
+        required.extend(local_ids)
+        if any(name not in by_id or by_id[name]["verdict"] != "pass" for name in required):
+            continue
+        semantic = semantic_certificate_digest({
+            "model": certificate["model"], "operation": operation, **identity,
+            "checker_launcher_sha256": certificate["runtime"]["bifrost_sha256"],
+            "checker_sources": certificate["checker_sources"],
+            "judgements": [{k: by_id[name][k] for k in ("id", "verdict", "unit_sha256", "text")}
+                           for name in sorted(required)],
+        })
+        rows.append({"model": certificate["model"], "operation": operation,
+                     **identity, "certificate": semantic})
+    return {"producer": f"{PRODUCER_CLASS} {CHECKER} {CHECKER_VERSION} model:{certificate['model'][:12]}",
+            "rows": rows}
 
 
 def well_formed_file(certificate: dict[str, Any], model_dir: str | os.PathLike[str]) -> dict[str, Any]:
@@ -550,8 +701,7 @@ def _canonical_transcript(stdout: str, *, nonce: str, workdir: Path, model: Path
 
 def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] | None = None,
           timeout: float | None = None, keep: bool = False) -> CheckResult:
-    """Run the checker once against ``model_dir``; write the certificate (and,
-    when well formed, ``model_well_formed.json``) under ``out_dir`` if given."""
+    """Run the checker once; write structural and per-operation facts under ``out_dir``."""
     # A failed or unavailable new check must never leave a prior positive fact
     # looking current.  Withdraw it before runtime/model resolution can fail.
     out = Path(out_dir) if out_dir is not None else None
@@ -559,6 +709,7 @@ def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] 
     if out is not None:
         out.mkdir(parents=True, exist_ok=True)
         target.unlink(missing_ok=True)
+        (out / "model_operation_checked.json").unlink(missing_ok=True)
     rt = runtime()
     source_root = Path(model_dir).resolve()
     workdir = Path(tempfile.mkdtemp(prefix="capcov-modelcheck-"))
@@ -581,6 +732,9 @@ def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] 
         if after_hashes != file_hashes or model_digest(root) != digest:
             raise ModelcheckFailure("the immutable model snapshot changed during checking")
         parsed = _parse_transcript(stdout, protocol_nonce)
+        if parsed["loaded"] != list(files):
+            raise ModelcheckFailure(
+                "runtime-loaded model files differ from the hashed model closure")
         judgements = []
         trusted_transcripts: list[str] = []
         judgement_elapsed = 0.0
@@ -597,7 +751,9 @@ def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] 
             text = unit_path.read_text(encoding="utf-8").replace(protocol_nonce, "<nonce>")
             judgements.append(Judgement(unit_id, verdict, message, unit_path.name, _sha256_bytes(text.encode("utf-8")), text))
         judgements.sort(key=lambda j: j.id)
-        status = "well-formed" if all(j.verdict == "pass" for j in judgements) and judgements else "ill-formed"
+        by_id = {j.id: j for j in judgements}
+        status = ("well-formed" if "registry-ids" in by_id
+                  and by_id["registry-ids"].verdict == "pass" else "ill-formed")
         canonical_transcript = _canonical_transcript(
             "".join(trusted_transcripts), nonce=protocol_nonce, workdir=workdir, model=root)
         transcript_sha256 = _sha256_bytes(canonical_transcript.encode("utf-8"))
@@ -615,6 +771,7 @@ def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] 
             "judgements": [{"id": j.id, "verdict": j.verdict, "message": j.message, "unit": j.unit,
                             "unit_sha256": j.unit_sha256, "text": j.text} for j in judgements],
             "skipped": [{"op": op, "reason": reason} for op, reason in parsed["skipped"]],
+            "operations": parsed["operations"],
             "transcript_sha256": transcript_sha256,
             "elapsed_seconds": round(elapsed + judgement_elapsed, 3),
         }
@@ -625,6 +782,9 @@ def check(model_dir: str | os.PathLike[str], *, out_dir: str | os.PathLike[str] 
             (out / "modelcheck-transcript.txt").write_text(canonical_transcript, encoding="utf-8")
             if fact is not None:
                 target.write_text(json.dumps(fact, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+            operations = _operation_facts(certificate)
+            (out / "model_operation_checked.json").write_text(
+                json.dumps(operations, indent=1, sort_keys=True) + "\n", encoding="utf-8")
         return CheckResult(status, digest, file_hashes, tuple(judgements), tuple(parsed["skipped"]), certificate, fact,
                            transcript_sha256, elapsed + judgement_elapsed, str(workdir) if keep else None)
     finally:
@@ -695,11 +855,9 @@ def recheck(certificate: dict[str, Any], model_dir: str | os.PathLike[str] | Non
             problems.append(f"unit {entry.get('id')}: text does not hash to unit_sha256")
     verdict = certificate.get("verdict")
     if verdict == "well-formed":
-        if not judgements:
-            problems.append("well-formed verdict with no judgements")
-        for entry in judgements:
-            if entry.get("verdict") != "pass":
-                problems.append(f"well-formed verdict but judgement {entry.get('id')} is {entry.get('verdict')}")
+        structural = [entry for entry in judgements if entry.get("id") == "registry-ids"]
+        if len(structural) != 1 or structural[0].get("verdict") != "pass":
+            problems.append("well-formed verdict without a passing global registry structure judgement")
     elif verdict != "ill-formed":
         problems.append(f"verdict is {verdict!r}")
     if model_dir is not None:
@@ -716,7 +874,7 @@ def recheck(certificate: dict[str, Any], model_dir: str | os.PathLike[str] | Non
     else:
         unchecked.append("model digest (no model directory given)")
     runtime_doc = certificate.get("runtime")
-    runtime_keys = {"impl", "bifrost_sha256", "shen_go_sha256", "invocation"}
+    runtime_keys = {"impl", "bifrost_sha256", "shen_go_sha256", "checker_binary", "invocation"}
     if not isinstance(runtime_doc, dict) or set(runtime_doc) != runtime_keys:
         problems.append("runtime identity is missing or has unknown fields")
     elif runtime_doc.get("impl") != IMPL:

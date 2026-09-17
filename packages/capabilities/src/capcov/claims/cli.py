@@ -21,9 +21,10 @@ Stage D's model checker (``claims/modelcheck.py``) is reached the same way::
 
 It typechecks the Shen domain model under ``DIR`` (``DIR/shen/load.shen``) and
 prints the certificate; with ``--out`` it writes ``modelcheck-certificate.json``,
-the transcript and, for a well-formed model only, ``model_well_formed.json``
-(the receipt file the replay exporter reads).  Exit 0 well-formed, 1 ill-formed
-(the failing judgements are in the JSON), 3 for a checker or runtime failure.
+the transcript, ``model_well_formed.json`` for valid global structure, and
+``model_operation_checked.json`` for successful operation-local checks. Exit 0
+when global structure is well formed (operation judgements may still fail), 1
+when global structure is ill formed, and 3 for a checker or runtime failure.
 
 The assumption registry (``claims/assumptions.py``) is reached the same way::
 
@@ -321,7 +322,8 @@ def main(argv: list[str]) -> int:
                                  help="an asm: id or the evidence id of an assumption row (repeatable)")
     mc = claims_sub.add_parser("modelcheck", help="Stage D: typed well-formedness of a Shen domain model")
     mc.add_argument("--model", required=True, help="model directory holding shen/load.shen")
-    mc.add_argument("--out", default=None, help="write the certificate, transcript and model_well_formed.json here")
+    mc.add_argument("--out", default=None,
+                    help="write the certificate, transcript, model_well_formed.json and model_operation_checked.json here")
     mc.add_argument("--timeout", type=float, default=None, help="seconds before the runtime is killed")
     mc.add_argument("--keep", action="store_true", help="keep the generated driver and units")
     args = parser.parse_args(argv)

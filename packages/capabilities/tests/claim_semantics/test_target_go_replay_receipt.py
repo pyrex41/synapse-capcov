@@ -162,11 +162,11 @@ class _JoinCase(unittest.TestCase):
         return bool(dict(self.join.result.python.relations).get("model_well_formed"))
 
     @classmethod
-    def _setup(cls, directory: Path, out_dir: Path) -> None:
+    def _setup(cls, directory: Path, out_dir: Path, reviewer_admissions=()) -> None:
         cls.directory = directory
         cls.out_dir = out_dir
         cls.replay_root = tempfile.mkdtemp(prefix="capcov-target-go-replay-diff-")
-        cls.join = replay_join.build(directory)
+        cls.join = replay_join.build(directory, reviewer_admissions=reviewer_admissions)
         if cls.join.bundle is not None and shutil.which("souffle") is not None:
             replay_join.evaluate_join(cls.join, cls.replay_root)
         cls.artifacts = replay_join.write_artifacts(cls.join, cls.out_dir)
@@ -554,7 +554,8 @@ class FixtureJoinTest(_JoinCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls._setup(fixture_cases.FIXTURE, Path(tempfile.mkdtemp(prefix="capcov-fixture-replay-out-")))
+        cls._setup(fixture_cases.FIXTURE, Path(tempfile.mkdtemp(prefix="capcov-fixture-replay-out-")),
+                   reviewer_admissions=fixture_cases.reviewer_admissions(fixture_cases.FIXTURE))
 
     def test_export(self) -> None:
         self.check_export()

@@ -47,28 +47,26 @@ REVIEWER_SOURCE = "reviewer claim-time observation"
 CENSUS_ASSUMPTION_SOURCE = "php-census assumed by the reviewer pending the PHP SCIP census"
 INDEX_ASSUMPTION_SOURCE = "reviewer assumed: synthetic census index pending the PHP SCIP census"
 MODEL_WITNESSES = ("model_describes_run", "model_observed", "model_admissible_closed",
-                   "model_scope_exclusions_closed", "model_well_formed", "model_checker_admitted")
+                   "model_scope_exclusions_closed", "model_well_formed",
+                   "model_operation_checked", "model_checker_admitted")
 REASONS = {
     "model_describes_run": "no model runner vouched that a model describes the run",
     "model_observed": "the receipt names no model, so the reviewer has no model digest to observe",
     "model_admissible_closed": "the receipt names no model, so no admissible-state set is closed",
     "model_scope_exclusions_closed": "the reviewer did not close the model-scope exclusion set for this model",
-    "model_well_formed": "no typed checker certified that the model describing this run is well formed",
-    "model_checker_admitted": "the reviewer admits no checker at the version that certified the model",
+    "model_well_formed": "no typed checker certified the model's global structure",
+    "model_operation_checked": "no successful operation-scoped checker certificate matches this model operation",
+    "model_checker_admitted": "the reviewer admits no exact checker, binary, and certificate tuple for this operation",
 }
 LEARN_UNMODELED_REASON = ("blocked by the learn campaign: its closed unmodelled list names this op, "
                           "so the model the judge is qualifying against does not model it")
 UNDECLARED_REASON = "blocked by undeclared writes: PHP or Go wrote a table the model's closed write set does not declare for this op"
-# Premises whose absence is "not built yet" rather than a finding against the
-# port.  The Stage D typed checker does not exist, so no real receipt can carry
-# a ``model_well_formed`` certificate and none of the committed real fixtures
-# does: a run blocked *only* here is **pending**, which ``summary``,
-# ``judge.json`` and the CLI's exit code keep distinct from unsupported.  This
-# is why the pair sits last in ``_BLOCKING_ORDER``: any premise that is a real
-# finding about the systems, the model or the review must win over it, so a
-# receipt reported as ``pending model_well_formed`` is one where every other
-# premise of ``op_qualified`` was checked and held.
-PENDING_PREMISES = ("model_well_formed", "model_checker_admitted")
+# Premises whose absence means checker authority is pending rather than a
+# finding against the port.  Structural validity, operation-local coverage,
+# and external reviewer admission are separate positive facts.  They sit last
+# in ``_BLOCKING_ORDER`` so every premise that can reveal a real finding about
+# the systems, model, or review is checked first.
+PENDING_PREMISES = ("model_well_formed", "model_operation_checked", "model_checker_admitted")
 QUALIFICATION_QUALIFIED = "qualified"
 QUALIFICATION_UNSUPPORTED = "unsupported"
 # The premises op_qualified_rt needs, in the order a reviewer checks them; the
@@ -94,9 +92,10 @@ _BLOCKING_ORDER = (
     ("learn_unmodeled_gate_closed", False), ("learn_unmodeled_any", True),
     ("kill_gap_closed", False), ("kill_closure_gap_any", True), ("index_describes_replay", False),
     ("op_declared", False),
-    # the Stage D premise, checked last (PENDING_PREMISES): the checker is not built, so an
-    # op that reaches it has passed every premise that says something about this port
-    ("model_well_formed", False), ("model_checker_admitted", False),
+    # Checker authority is checked last (PENDING_PREMISES): an op reaches these
+    # premises only after every check that can expose a port or model finding.
+    ("model_well_formed", False), ("model_operation_checked", False),
+    ("model_checker_admitted", False),
 )
 # per-run relations of _BLOCKING_ORDER whose only column is the run
 _RUN_ONLY = ("replay_run_current", "kill_gap_closed", "oracle_stable")
@@ -121,14 +120,14 @@ def exclusions(relations, run: str) -> list[dict[str, str]]:
 def well_formed_certificate(relations, run: str) -> dict[str, str] | list[dict[str, str]] | str:
     """The typed checker's certificate for the model(s) describing ``run``.
 
-    ``{"checker", "version", "certificate"}`` for the one certificate, ``"missing"``
-    when no checker certified the model op_qualified_rt joins (the premise is
+    ``{"checker", "version", "binary", "certificate"}`` for the structural
+    certificate, ``"missing"`` when no checker certified the model structure (the premise is
     positive and has no closure, so "missing" is exactly what the judge knows), and
     the list when a model carries more than one.
     """
     rows = dict(relations) if not isinstance(relations, dict) else relations
     models = {r[0] for r in rows.get("model_describes_run", ()) if r[1] == run}
-    certificates = sorted(({"checker": r[1], "version": r[2], "certificate": r[3]}
+    certificates = sorted(({"checker": r[1], "version": r[2], "binary": r[3], "certificate": r[4]}
                            for r in rows.get("model_well_formed", ()) if r[0] in models),
                           key=canonical_json)
     if not certificates:
@@ -203,8 +202,11 @@ def blocking_premise(relations, run: str, op: str, index: str = SYNTHETIC_INDEX)
                 return True
             if name == "model_well_formed" and r[0] in models:
                 return True
+            if name == "model_operation_checked" and r[0] in models and r[1] == op:
+                return True
             if name == "model_checker_admitted" and any(
-                    w[0] in models and w[1:3] == r for w in rows.get("model_well_formed", ())):
+                    w[0] in models and w[1] == op
+                    and w == r for w in rows.get("model_operation_checked", ())):
                 return True
             if r[:2] == (run, op):
                 return True
@@ -338,9 +340,10 @@ def build(directory: Path, *, reviewer_admissions=()) -> ReplayJoin:
                                  CENSUS_ASSUMPTION_SOURCE, kind="assumption",
                                  depends_on=[f"external:index:{SYNTHETIC_INDEX}"]))
     join.assumption_ids = tuple(record.id for _, record in assumptions)
-    present = {record.atom.relation: record.id for record in exported.bundle.evidence
-               if record.atom.relation in MODEL_WITNESSES}
-    present.update({record.atom.relation: record.id for _, record in additions if record.atom.relation in MODEL_WITNESSES})
+    present: dict[str, list[Evidence]] = {}
+    for record in (*exported.bundle.evidence, *(record for _, record in additions)):
+        if record.atom.relation in MODEL_WITNESSES:
+            present.setdefault(record.atom.relation, []).append(record)
     # the effect rows the model's closed write set does not cover, per op (what
     # the undeclared_write rules will derive from), so the why-not can name them
     exported_rows = {name: [] for name in ("replay_request", "php_effect", "go_effect", "model_writes", "model_writes_closed",
@@ -397,13 +400,34 @@ def build(directory: Path, *, reviewer_admissions=()) -> ReplayJoin:
                 requires_any_evidence=tuple(sorted(offending)), when_claim="unresolved"))
         for relation in MODEL_WITNESSES:
             context = ("run",) if relation in ("model_describes_run", "model_admissible_closed") else ()
-            diagnostics.append(DiagnosticRule(relation, "observation", "complete", context, claim_id=qualified.id))
-            if relation == "model_checker_admitted" and "model_well_formed" not in present:
-                # "the reviewer admits no checker at the version that certified the model" is
-                # not a premise a receipt with no certificate at all is missing: the missing
-                # premise is the certificate, and naming both would report one gap twice.
+            predicate = (("column", "operation"), ("operator", "="), ("value", op)) \
+                if relation in ("model_operation_checked", "model_checker_admitted") else ()
+            diagnostics.append(DiagnosticRule(relation, "observation", "complete", context,
+                                              claim_id=qualified.id, predicate=predicate))
+            structure_for_model = any(
+                evidence.atom.relation == "model_well_formed"
+                and evidence.atom.terms[0].value == receipt["model"]
+                for evidence in exported.bundle.evidence)
+            checked_for_op = any(
+                evidence.atom.relation == "model_operation_checked"
+                and evidence.atom.terms[0].value == receipt["model"]
+                and evidence.atom.terms[1].value == op
+                for evidence in exported.bundle.evidence)
+            if relation in ("model_operation_checked", "model_checker_admitted") and not structure_for_model:
+                # Structural validity is the first missing checker premise.
                 continue
-            excludes = (present[relation],) if relation in present else ()
+            if relation == "model_checker_admitted" and not checked_for_op:
+                # Admission is meaningful only after a matching operation result exists.
+                continue
+            records = present.get(relation, [])
+            if relation in ("model_operation_checked", "model_checker_admitted"):
+                records = [record for record in records
+                           if record.atom.terms[0].value == receipt["model"]
+                           and record.atom.terms[1].value == op]
+            elif relation == "model_well_formed":
+                records = [record for record in records
+                           if record.atom.terms[0].value == receipt["model"]]
+            excludes = tuple(record.id for record in records)
             outputs.append(OutputTemplate(
                 "missing_premise", qualified.id, relation=relation,
                 fields=(("reason", TemplateValue("constant", "", "symbol", REASONS[relation])),),
@@ -593,8 +617,17 @@ def summary(join: ReplayJoin) -> dict[str, Any]:
                                                    + ", ".join(applied))
         out[op] = entry
     out["exclusions"] = exclusions(relations, join.run) if relations else []
-    # the Stage D premise: what typechecked the model this run is judged against
+    # Global structure and per-operation checker evidence stay separate.
     out["model_well_formed"] = well_formed_certificate(relations, join.run) if relations else "missing"
+    if relations:
+        models = {r[0] for r in relations.get("model_describes_run", ()) if r[1] == join.run}
+        out["model_operation_checked"] = sorted(
+            [{"operation": r[1], "checker": r[2], "version": r[3],
+              "binary": r[4], "certificate": r[5]}
+             for r in relations.get("model_operation_checked", ())
+             if r[0] in models and r[1] in ops], key=canonical_json)
+    else:
+        out["model_operation_checked"] = []
     out["learn"] = learn_summary(relations, join.run) if relations else {"present": False}
     out["stability"] = {
         "rows": sorted([list(r[1:]) for r in relations.get("replay_stability", ()) if r[0] == join.run], key=canonical_json),

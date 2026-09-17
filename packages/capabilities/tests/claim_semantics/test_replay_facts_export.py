@@ -747,6 +747,7 @@ class UniqueObservationTest(_Exported):
                          {"php_effect", "go_effect", "model_effect", "php_post_state", "go_post_state",
                           "php_effect_seq", "go_effect_seq", "model_effect_seq", "replay_request_seq",
                           "php_response", "go_response", "replay_stability", "model_well_formed",
+                          "model_operation_checked",
                           # a prediction is a set of admissible states per tape position, so the
                           # state digest is part of its key; the oracle answered once per position
                           "learn_prediction", "learn_observation"})
@@ -858,16 +859,22 @@ class ScopeExclusionTest(_Exported):
 
 
 class ModelWellFormedTest(_Exported):
-    """The typed certificate and separately supplied reviewer authority."""
+    """Structural validity, operation-scoped coverage, and external authority."""
 
-    CERTIFICATE = hashlib.sha256(b"pending: checker not yet built").hexdigest()
+    OPERATION = "delete-issue"
+    CHECKED = json.loads((FIXTURE / "model_operation_checked.json").read_text())["rows"]
+    OP_ROW = next(row for row in CHECKED if row["operation"] == "delete-issue")
+    CERTIFICATE = OP_ROW["certificate"]
+    BINARY = OP_ROW["checker_binary"]
 
     def admission(self, **changes):
         entry = {
-            "producer": "reviewer fixture-reviewer admitted exact model check 2026-09-16",
+            "producer": "reviewer replay-authority-test-admission-v1",
             "model": self.model,
             "checker": "stage-d-typecheck",
             "checker_version": "0.1-pending",
+            "operation": self.OPERATION,
+            "checker_binary": self.BINARY,
             "certificate": self.CERTIFICATE,
         }
         entry.update(changes)
@@ -876,7 +883,8 @@ class ModelWellFormedTest(_Exported):
     def test_the_certificate_exports_under_the_modelcheck_class(self) -> None:
         [record] = _evidence(self.bundle, "model_well_formed")
         self.assertEqual([t.value for t in record.atom.terms],
-                         [self.model, "stage-d-typecheck", "0.1-pending", self.CERTIFICATE])
+                         [self.model, "stage-d-typecheck", "0.1-pending", "b" * 64,
+                          json.loads((FIXTURE / "model_well_formed.json").read_text())["rows"][0]["certificate"]])
         self.assertEqual(record.kind, "fact")
         self.assertEqual(record.source, f"modelcheck stage-d-typecheck 0.1-pending model:{self.model[:12]}")
         self.assertTrue(record.id.startswith("modelcheck:"))
@@ -894,16 +902,31 @@ class ModelWellFormedTest(_Exported):
     def test_external_admission_pins_and_depends_on_the_exact_certificate(self) -> None:
         result = self.export(reviewer_admissions=[self.admission()])
         self.assertEqual(result.status, replay_facts.STATUS_COMPLETE, result.messages)
-        [certificate] = _evidence(result.bundle, "model_well_formed")
+        checked = next(e for e in _evidence(result.bundle, "model_operation_checked")
+                       if e.atom.terms[1].value == self.OPERATION)
         [admitted] = _evidence(result.bundle, "model_checker_admitted")
-        self.assertEqual([t.value for t in admitted.atom.terms], ["stage-d-typecheck", "0.1-pending"])
+        self.assertEqual([t.value for t in admitted.atom.terms],
+                         [self.model, self.OPERATION, "stage-d-typecheck", "0.1-pending",
+                          self.BINARY, self.CERTIFICATE])
         self.assertEqual(admitted.source,
-                         "reviewer fixture-reviewer admitted exact model check 2026-09-16")
+                         "reviewer replay-authority-test-admission-v1")
         self.assertTrue(admitted.id.startswith("reviewer:"))
-        self.assertEqual(admitted.context.as_dict(), {})
-        self.assertEqual(admitted.depends_on, (certificate.id,))
+        self.assertEqual(admitted.context.as_dict(), {"model": self.model, "operation": self.OPERATION})
+        self.assertEqual(admitted.depends_on, (checked.id,))
         self.assertEqual(dict(dict(result.bundle.metadata)["producers"])["model_checker_admitted"],
                          admitted.source)
+
+    def test_admitting_one_checked_operation_does_not_admit_other_operations(self) -> None:
+        def only_delete(document):
+            return {**document, "rows": [row for row in document["rows"]
+                                         if row["operation"] == self.OPERATION]}
+        with _variant(model_operation_checked=only_delete) as root:
+            result = self.export(root, reviewer_admissions=[self.admission()])
+        self.assertEqual(result.status, replay_facts.STATUS_COMPLETE, result.messages)
+        self.assertEqual([row[1] for row in _rows(result.bundle, "model_operation_checked")],
+                         [self.OPERATION])
+        self.assertEqual([row[1] for row in _rows(result.bundle, "model_checker_admitted")],
+                         [self.OPERATION])
 
     def test_receipt_self_admission_is_ignored_even_when_malformed_or_hostile(self) -> None:
         with _variant(model_checkers=lambda _: {
@@ -917,6 +940,16 @@ class ModelWellFormedTest(_Exported):
         self.assertTrue(any("model_checkers.json ignored" in m for m in result.messages))
         self.assertEqual(dict(result.bundle.metadata)["replay_digest"], self.identity,
                          "ignored receipt-local authority must not affect identity")
+
+    def test_placeholder_external_reviewers_contribute_no_admission(self) -> None:
+        for reviewer in sorted(replay_facts.UNSIGNED_REVIEWERS - {""}) + ["Unassigned", "  TBD  "]:
+            with self.subTest(reviewer=reviewer):
+                result = self.export(reviewer_admissions=[
+                    self.admission(producer=f"reviewer {reviewer}")])
+                self.assertEqual(result.status, replay_facts.STATUS_COMPLETE, result.messages)
+                self.assertEqual(_rows(result.bundle, "model_checker_admitted"), [])
+                self.assertTrue(any("placeholder" in message and "contributes no authority" in message
+                                    for message in result.messages), result.messages)
 
     def test_the_model_host_may_not_certify_its_own_model(self) -> None:
         for producer in ("shen shen-model-host v1", "reviewer fixture-reviewer", "replay fg-replay v1"):
@@ -940,7 +973,8 @@ class ModelWellFormedTest(_Exported):
         [message] = result.messages
         self.assertIn("certifies model 'aaaaaaaaaaaa'", message)
         self.assertIn("the certificate is for another model", message)
-        self.assertEqual(replay_facts.STALE_ON_FOREIGN_MODEL, frozenset({"model_well_formed"}))
+        self.assertEqual(replay_facts.STALE_ON_FOREIGN_MODEL,
+                         frozenset({"model_well_formed", "model_operation_checked"}))
         # a model-scoped relation that is merely *about* this model stays invalid-input
         with _variant(model_writes=other) as root:
             result = self.export(root)
@@ -964,7 +998,8 @@ class ModelWellFormedTest(_Exported):
     def test_a_malformed_certificate_row_is_invalid_input(self) -> None:
         for edits, needle in (
                 ({"model_well_formed": lambda d: {**d, "rows": [{"model": d["rows"][0]["model"],
-                                                                 "checker": "c", "checker_version": "v"}]}},
+                                                                 "checker": "c", "checker_version": "v",
+                                                                 "checker_binary": "b" * 64}]}},
                  "lacks columns ['certificate']"),
                 ({"model_well_formed": lambda d: {**d, "rows": [{**d["rows"][0], "checker": 3}]}},
                  "model_well_formed.checker: expected str")):
@@ -976,8 +1011,10 @@ class ModelWellFormedTest(_Exported):
     def test_external_admission_must_match_every_certificate_identity_field(self) -> None:
         mismatches = {
             "model": "a" * 64,
+            "operation": "other-op",
             "checker": "other-checker",
             "checker_version": "other-version",
+            "checker_binary": "a" * 64,
             "certificate": "b" * 64,
         }
         for field, value in mismatches.items():
@@ -1012,13 +1049,14 @@ class ModelWellFormedTest(_Exported):
     def test_ambiguous_checker_result_is_rejected_before_it_can_be_admitted(self) -> None:
         def ambiguous(document):
             document = copy.deepcopy(document)
-            document["rows"].append({**document["rows"][0], "certificate": "b" * 64})
+            row = next(row for row in document["rows"] if row["operation"] == self.OPERATION)
+            document["rows"].append({**row, "certificate": "b" * 64})
             return document
 
-        with _variant(model_well_formed=ambiguous) as root:
+        with _variant(model_operation_checked=ambiguous) as root:
             result = self.export(root, reviewer_admissions=[self.admission()])
         self.assertEqual(result.status, replay_facts.STATUS_INVALID_INPUT)
-        self.assertIn("one observation per model_well_formed key", result.messages[0])
+        self.assertIn("one observation per model_operation_checked key", result.messages[0])
 
 
 class ProducerAuthorityTest(_Exported):

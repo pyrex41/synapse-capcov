@@ -60,6 +60,8 @@ MODEL = "08380c9c336dc3f8e693aeea0589a60cfe808836a75bf2b815fa7cd8b39f0e7b"
 #: the corpus fixture's placeholder pair, never a real checker's output.
 SYNTHETIC_CHECKER = ("stage-d-typecheck", "0.1-pending")
 SYNTHETIC_CERTIFICATE = hashlib.sha256(b"pending: checker not yet built").hexdigest()
+SYNTHETIC_OPERATION_CERTIFICATE = hashlib.sha256(b"test-only delete-issue operation check").hexdigest()
+SYNTHETIC_BINARY = "b" * 64
 QUALIFIED = "claim-qualified-delete-issue"
 CONSTRAINS = "claim-corpus-constrains-delete-issue"
 APPLIED = "claim-exclusions-applied-delete-issue"
@@ -95,7 +97,13 @@ def _add_synthetic_certificate(destination: Path) -> Path:
     (destination / "model_well_formed.json").write_text(json.dumps(
         {"producer": f"modelcheck {checker} {version} model:{model[:12]}",
          "rows": [{"model": model, "checker": checker, "checker_version": version,
+                   "checker_binary": SYNTHETIC_BINARY,
                    "certificate": SYNTHETIC_CERTIFICATE}]}, indent=1, sort_keys=True) + "\n")
+    (destination / "model_operation_checked.json").write_text(json.dumps(
+        {"producer": f"modelcheck {checker} {version} model:{model[:12]}",
+         "rows": [{"model": model, "operation": "delete-issue", "checker": checker,
+                   "checker_version": version, "checker_binary": SYNTHETIC_BINARY,
+                   "certificate": SYNTHETIC_OPERATION_CERTIFICATE}]}, indent=1, sort_keys=True) + "\n")
     return destination
 
 
@@ -104,8 +112,9 @@ def _synthetic_admissions(destination: Path) -> list[dict[str, str]]:
     model = json.loads((destination / "receipt.json").read_text())["model"]
     checker, version = SYNTHETIC_CHECKER
     return [{"producer": "reviewer synthetic test-local exact certificate review",
-             "model": model, "checker": checker, "checker_version": version,
-             "certificate": SYNTHETIC_CERTIFICATE}]
+             "model": model, "operation": "delete-issue", "checker": checker,
+             "checker_version": version, "checker_binary": SYNTHETIC_BINARY,
+             "certificate": SYNTHETIC_OPERATION_CERTIFICATE}]
 
 
 def _souffle() -> None:

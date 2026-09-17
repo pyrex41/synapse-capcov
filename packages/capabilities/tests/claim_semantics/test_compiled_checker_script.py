@@ -78,14 +78,10 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         return completed, out
 
     def synthetic_admissions(self) -> Path:
-        [row] = json.loads((replay_join.SYNTHETIC_RECEIPT_DIR / "model_well_formed.json").read_text())["rows"]
+        rows = json.loads((replay_join.SYNTHETIC_RECEIPT_DIR / "model_operation_checked.json").read_text())["rows"]
         path = self.workspace / "synthetic-reviewer-admissions.json"
-        path.write_text(json.dumps([{
-            "producer": "reviewer synthetic-test-policy",
-            "model": row["model"], "checker": row["checker"],
-            "checker_version": row["checker_version"],
-            "certificate": row["certificate"],
-        }]), encoding="utf-8")
+        path.write_text(json.dumps([{"producer": "reviewer synthetic-test-policy", **row}
+                                    for row in rows]), encoding="utf-8")
         return path
 
     def test_the_qualified_receipt_is_pending_the_checker_and_exits_five(self) -> None:
