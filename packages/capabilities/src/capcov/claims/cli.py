@@ -457,11 +457,28 @@ def _static(args) -> int:
         return 2
     ast_raw = {}
     if args.ast_raw:
-        loaded = _load_json(args.ast_raw)
+        try:
+            loaded = _load_json(args.ast_raw)
+        except (OSError, json.JSONDecodeError) as exc:
+            _emit({"refusal": f"cannot read --ast-raw JSON: {exc}"}, None)
+            return 2
         if not isinstance(loaded, dict):
             _emit({"refusal": "--ast-raw must hold the tree-sitter raw dict (a JSON object)"}, None)
             return 2
         ast_raw = loaded
+    try:
+        resolve.normalizer(args.language)
+    except ValueError as exc:
+        _emit({"refusal": str(exc)}, None)
+        return 2
+    try:
+        # Fail before invoking an indexer if this language cannot be censused.
+        # A missing parser must never turn into an empty census and a closure
+        # witness over work that was not examined.
+        blindspots.require_census_tools(args.language)
+    except ValueError as exc:
+        _emit({"operational_failure": "census-unavailable", "error": str(exc)}, None)
+        return 3
     try:
         closure.require_scip_tools(args.language, root)
     except (resolve.ScipToolsUnavailable, ValueError) as exc:
@@ -630,9 +647,8 @@ def main(argv: list[str]) -> int:
     static.add_argument("--target", required=True, help="the source tree to index")
     static.add_argument("--language", default="go", help="SCIP language of the tree (default go)")
     static.add_argument("--ast-raw", default=None,
-                        help="JSON file holding the tree-sitter raw dict (the exporter's "
-                             "AST_RAW contract); without it the census is unavailable and "
-                             "no closure witness is emitted")
+                        help="optional JSON file holding the adapter's AST_RAW facts; "
+                             "the complete call-site census is read independently from the target")
     static.add_argument("--scope", default="all",
                         help="all (default), package:PREFIX or documents:A,B")
     static.add_argument("--timeout-seconds", type=int, default=600,

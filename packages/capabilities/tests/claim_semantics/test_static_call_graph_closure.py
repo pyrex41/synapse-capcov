@@ -29,6 +29,8 @@ Four properties, one per section.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -327,6 +329,31 @@ class AbsentScipToolsAreNamedTests(unittest.TestCase):
         document = json.loads(proc.stdout)
         self.assertEqual(document["operational_failure"], "scip-tools-unavailable")
         self.assertIn("--resolver scip needs the go indexer 'scip-go'", document["error"])
+
+    def test_the_cli_checks_census_dependencies_before_starting_scip(self) -> None:
+        from capcov.claims.cli import main as claims_main
+
+        output = io.StringIO()
+        with unittest.mock.patch(
+            "capcov.scip.blindspots.require_census_tools",
+            side_effect=ValueError("blind-spot enumeration for 'go' needs the 'treesitter' extra"),
+        ) as census, unittest.mock.patch(
+            "capcov.claims.static.closure.require_scip_tools"
+        ) as scip_tools, unittest.mock.patch(
+            "capcov.scip.runner.run_scip_index"
+        ) as indexer, contextlib.redirect_stdout(output):
+            status = claims_main([
+                "claims", "static", "--static", "scip", "--target", str(GO_APP),
+                "--language", "go",
+            ])
+
+        self.assertEqual(status, 3)
+        self.assertEqual(census.call_args.args, ("go",))
+        scip_tools.assert_not_called()
+        indexer.assert_not_called()
+        document = json.loads(output.getvalue())
+        self.assertEqual(document["operational_failure"], "census-unavailable")
+        self.assertIn("treesitter' extra", document["error"])
 
     def test_the_cli_refuses_an_unknown_profile(self) -> None:
         proc = subprocess.run(

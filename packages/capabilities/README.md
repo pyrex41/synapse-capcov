@@ -228,14 +228,22 @@ and judge the model_* files the receipt already carries
 
 ```sh
 capcov experiment claims static --static scip --target <tree> --language go \
-    --ast-raw ast.json --out bundle.json
+    --out bundle.json
 ```
 
 `--static scip` is the static half of the same idea. It indexes the tree with
 upstream's resolver (`capcov.scip.runner` + `resolve.hybrid_raw` +
-`blindspots.enumerate_blind_spots`, none of them modified), exports the bundle
+`blindspots.enumerate_blind_spots`), exports the bundle
 with `capcov.claims.static.scip_facts` exactly as before, and **additionally**
 emits two relations beside that export:
+
+The complete call-site census is read from the target tree. `--ast-raw` is an
+optional input for adapter AST facts; it does not supply or suppress the census.
+For Go and PHP, install the parser dependency with `pip install .[treesitter]`.
+The profile checks that parser before starting the SCIP indexer and exits with
+`census-unavailable` if the optional extra is missing. Python census uses only
+the standard library. The indexer and `scip` CLI remain separate external tools
+as described in the SCIP resolver section above.
 
 * `static_unresolved_call_site(index, file, line, symbol)` — the resolver's
   enumerated `scip_residue` as rows rather than a count. `symbol` is the callee
