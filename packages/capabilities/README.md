@@ -380,6 +380,11 @@ or real credentials. Run the unittest suite and build/install checks before a PR
 The engine is distributed under the repository's MIT license, included in both
 Python distribution formats.
 
+The bounded qualification measurement runner records command and lock timing,
+cache state, and output identities without persisting argv, environment values,
+or host paths. Its limits and manifest format are documented in
+[`experiments/claim-semantics/qualification-measurement.md`](experiments/claim-semantics/qualification-measurement.md).
+
 ## Many worktrees, many agents, one machine
 
 Every artifact binds to a source snapshot: sha256 over a sorted manifest of per-file
