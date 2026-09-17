@@ -27,8 +27,11 @@ HERE = Path(__file__).resolve().parent
 LOCK_HELPER = HERE / "with-heavy-lock.py"
 MAX_SAMPLES = 8
 MAX_BUDGET_SECONDS = 900
+MAX_SOURCE_BYTES = 32 * 1024 * 1024
 MAX_TREE_FILES = 20_000
 MAX_TREE_BYTES = 256 * 1024 * 1024
+MAX_TOOLCHAIN_BINARIES = 12
+MAX_TOOLCHAIN_BINARY_BYTES = 512 * 1024 * 1024
 TAIL_BYTES = 16 * 1024
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 PIN = re.compile(r"^(?:[0-9a-fA-F]{7,64}|not-applicable|unknown|unpinned)$")
@@ -88,8 +91,42 @@ def _source_identity(root_value: str) -> dict[str, Any]:
                           capture_output=True, check=False)
     if diff.returncode or len(diff.stdout) > 32 * 1024 * 1024:
         raise MeasurementError("source diff failed or exceeded the 32 MiB bound")
-    return {"commit": commit.stdout.strip(), "working_tree_sha256": hashlib.sha256(diff.stdout).hexdigest(),
-            "dirty": bool(diff.stdout)}
+    untracked = subprocess.run(
+        ["git", "-C", str(root), "ls-files", "--others", "--exclude-standard", "-z"],
+        capture_output=True, check=False)
+    if untracked.returncode:
+        raise MeasurementError("could not enumerate untracked source files")
+    paths = sorted(p for p in untracked.stdout.split(b"\0") if p)
+    if len(diff.stdout) > MAX_SOURCE_BYTES or len(paths) > MAX_TREE_FILES:
+        raise MeasurementError("source diff exceeded the source identity bound")
+    identity = hashlib.sha256()
+    identity.update(b"tracked-diff\0")
+    identity.update(diff.stdout)
+    total = len(diff.stdout)
+    for raw_path in paths:
+        relative = Path(os.fsdecode(raw_path))
+        path = root / relative
+        if path.is_symlink():
+            content = os.fsencode(os.readlink(path))
+            kind = b"symlink\0"
+        elif path.is_file():
+            remaining = MAX_SOURCE_BYTES - total - len(raw_path)
+            if path.stat().st_size > remaining:
+                raise MeasurementError("untracked source files exceeded the source identity bound")
+            content = path.read_bytes()
+            kind = b"file\0"
+        else:
+            raise MeasurementError("an untracked source entry is not a regular file or symlink")
+        total += len(raw_path) + len(content)
+        if total > MAX_SOURCE_BYTES:
+            raise MeasurementError("untracked source files exceeded the source identity bound")
+        identity.update(kind)
+        identity.update(len(raw_path).to_bytes(8, "big"))
+        identity.update(raw_path)
+        identity.update(len(content).to_bytes(8, "big"))
+        identity.update(content)
+    return {"commit": commit.stdout.strip(), "working_tree_sha256": identity.hexdigest(),
+            "dirty": bool(diff.stdout or paths), "untracked_files": len(paths)}
 
 
 def _toolchain(sample: dict[str, Any], name: str) -> dict[str, str]:
@@ -99,6 +136,30 @@ def _toolchain(sample: dict[str, Any], name: str) -> dict[str, str]:
                                              for k, v in pins.items()):
         raise MeasurementError(f"sample {name} toolchain must map safe pin names to revisions or status labels")
     return dict(sorted(pins.items()))
+
+
+def _toolchain_binaries(sample: dict[str, Any], name: str) -> dict[str, dict[str, Any]]:
+    binaries = sample.get("toolchain_binaries", {})
+    if (not isinstance(binaries, dict) or len(binaries) > MAX_TOOLCHAIN_BINARIES or
+            not all(isinstance(k, str) and SAFE_ID.fullmatch(k) and isinstance(v, str)
+                    for k, v in binaries.items())):
+        raise MeasurementError(f"sample {name} toolchain_binaries must map at most 12 safe ids to paths")
+    result = {}
+    for binary_id, path_value in sorted(binaries.items()):
+        path = Path(path_value)
+        if not path.is_absolute():
+            raise MeasurementError(f"sample {name} toolchain binary paths must be absolute")
+        try:
+            resolved = path.resolve(strict=True)
+            info = resolved.stat()
+        except OSError as exc:
+            raise MeasurementError(f"sample {name} toolchain binary {binary_id} is unavailable") from exc
+        if not resolved.is_file() or not os.access(resolved, os.X_OK):
+            raise MeasurementError(f"sample {name} toolchain binary {binary_id} is not executable")
+        if info.st_size > MAX_TOOLCHAIN_BINARY_BYTES:
+            raise MeasurementError(f"sample {name} toolchain binary {binary_id} exceeds the 512 MiB bound")
+        result[binary_id] = {"sha256": _file_hash(resolved), "bytes": info.st_size}
+    return result
 
 
 def _tail_reader(stream, state: dict[str, Any]) -> None:
@@ -207,14 +268,22 @@ def _sample(sample: dict[str, Any], *, index: int, planned: int, logs: Path,
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
         timed_out = True
-        proc.terminate()
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            pass
+        # The lock wrapper can exit after its direct child exits while a
+        # grandchild remains in the owned process group. Always kill the group
+        # after the grace period, even if the leader has already been reaped.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        if proc.poll() is None:
             proc.wait()
     for reader in readers:
         reader.join(timeout=5)
@@ -256,6 +325,7 @@ def _sample(sample: dict[str, Any], *, index: int, planned: int, logs: Path,
         "comparison_group": group,
         "cache_state": cache_state,
         "toolchain": _toolchain(sample, name),
+        "resolved_toolchain_binaries": _toolchain_binaries(sample, name),
         "source": source, "input_identity": input_identity,
         "output_identity": output_identity,
         "native_cache_before": cache_before, "native_cache_after": cache_after,

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "measure_qualification.py"
@@ -57,6 +59,7 @@ class MeasureQualificationTest(unittest.TestCase):
                 samples.append({"id": name, "phase": "replay-judge", "sample_kind": kind,
                                 "comparison_group": "replay", "cache_state": kind,
                                 "toolchain": {"nixpkgs_rev": "34ab99075ac4f7e40cf037eef32cb1c360bb85e9"},
+                                "toolchain_binaries": {"python": sys.executable},
                                 "source_root": str(self.source), "input_root": str(receipt),
                                 "output_root": str(output), "cache_dir": str(cache),
                                 "command": [sys.executable, "-c", code], "timeout_seconds": 5,
@@ -83,7 +86,12 @@ class MeasureQualificationTest(unittest.TestCase):
         serialized = json.dumps(report)
         self.assertNotIn("unguessable-private-value", serialized)
         self.assertNotIn(str(self.root), serialized)
+        self.assertNotIn(sys.executable, serialized)
         self.assertNotIn("command", report["samples"][0])
+        self.assertEqual(report["samples"][0]["resolved_toolchain_binaries"]["python"]["bytes"],
+                         Path(sys.executable).stat().st_size)
+        self.assertEqual(report["samples"][0]["resolved_toolchain_binaries"]["python"]["sha256"],
+                         hashlib.sha256(Path(sys.executable).read_bytes()).hexdigest())
         tail = (logs / "cold.stdout.tail").read_text()
         self.assertNotIn("unguessable-private-value", tail)
         self.assertNotIn("/tmp/private-example", tail)
@@ -94,12 +102,48 @@ class MeasureQualificationTest(unittest.TestCase):
     def test_incomplete_output_hashes_never_claim_identity_match(self) -> None:
         sys.path.insert(0, str(SCRIPT.parent))
         try:
-            from measure_qualification import _comparisons
+            from measure_qualification import _comparisons, _source_identity
         finally:
             sys.path.pop(0)
         pair = [{"comparison_group": "large", "sample_kind": kind,
                  "output_identity": {"sha256": None}} for kind in ("cold", "warm")]
         self.assertFalse(_comparisons(pair)[0]["output_identity_matches"])
+        before = _source_identity(str(self.source))
+        (self.source / "untracked.txt").write_text("included in the source identity\n")
+        after = _source_identity(str(self.source))
+        self.assertTrue(after["dirty"])
+        self.assertEqual(after["untracked_files"], 1)
+        self.assertNotEqual(before["working_tree_sha256"], after["working_tree_sha256"])
+
+    def test_timeout_kills_grandchildren_in_owned_process_group(self) -> None:
+        marker = self.root / "grandchild-survived"
+        child = (
+            "import pathlib,signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "time.sleep(1.5); pathlib.Path(" + repr(str(marker)) + ").write_text('alive')"
+        )
+        parent = (
+            "import subprocess,sys,time; subprocess.Popen([sys.executable, '-c', "
+            + repr(child) + "]); time.sleep(10)"
+        )
+        manifest = self.root / "timeout-manifest.json"
+        report_path = self.root / "timeout-report.json"
+        logs = self.root / "timeout-logs"
+        manifest.write_text(json.dumps({
+            "schema": "capcov-qualification-measurement-v1",
+            "samples": [{"id": "timeout", "phase": "process-cleanup",
+                         "source_root": str(self.source), "timeout_seconds": 1,
+                         "toolchain_binaries": {"python": sys.executable},
+                         "command": [sys.executable, "-c", parent]}],
+        }))
+        result = subprocess.run(
+            [sys.executable, str(SCRIPT), str(manifest), "--report", str(report_path),
+             "--logs", str(logs), "--lock", str(self.root / "timeout.lock"),
+             "--command-timeout", "5"], capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        report = json.loads(report_path.read_text())
+        self.assertTrue(report["samples"][0]["timed_out"])
+        time.sleep(1.7)
+        self.assertFalse(marker.exists(), "timed-out sample left a grandchild running")
 
     def test_native_shake_zero_target_pass_is_refused(self) -> None:
         result, report, _ = self._run(all_skip=True)
