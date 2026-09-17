@@ -934,12 +934,20 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
     for line in diagnostics:
         print(f"capcov {command} --judge claims: {line}", file=sys.stderr)
     exit_code = int(document["exit_code"])
-    print(
-        f"capcov {command} --judge claims: {document['verdict']} "
-        f"(judge exit {exit_code}); kernels {', '.join(document['kernels']) or '-'}; "
-        f"differential {document['differential']}; "
-        f"wrote {out_dir / claims_judge.JUDGE_FILE}"
-    )
+    # `--quiet` governs what this flag adds, as it governs the rest of the
+    # command: the per-op summary above and this closing line are the judge's,
+    # and a quiet run prints neither, leaving stdout exactly what it is without
+    # `--judge claims` at all.  Nothing is lost by the silence -- judge.json
+    # carries the verdict, the kernels and the judge's own exit code, and this
+    # process's exit code answers the gate's question either way.  Diagnostics
+    # stay on stderr, which `--quiet` has never governed.
+    if not args.quiet:
+        print(
+            f"capcov {command} --judge claims: {document['verdict']} "
+            f"(judge exit {exit_code}); kernels {', '.join(document['kernels']) or '-'}; "
+            f"differential {document['differential']}; "
+            f"wrote {out_dir / claims_judge.JUDGE_FILE}"
+        )
     return 0 if exit_code == claims_judge.EXIT_OK else 1
 
 

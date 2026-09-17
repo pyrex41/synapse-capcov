@@ -537,6 +537,29 @@ class DefaultEvaluatorNeedsNoToolTests(unittest.TestCase):
         self.assertIn("kernels python", proc.stdout)
         self.assertIn("differential not-run (single evaluator)", proc.stdout)
 
+    def test_quiet_silences_everything_the_judge_adds_to_stdout(self) -> None:
+        """`--quiet` governs the opt-in judge exactly as it governs the rest.
+
+        `gate` prints its own four-cell verdict whether or not `--quiet` was
+        passed -- that is upstream's behaviour and not ours to move -- so what
+        `--quiet` must do here is leave the command's stdout exactly what it is
+        without `--judge claims` at all: the per-op summary and the closing
+        verdict line are the judge's, and a quiet run prints neither.  Nothing
+        is lost by the silence: judge.json still carries the verdict, the
+        kernels and the judge's own exit code, and the process exit code is the
+        one the loud run returned.
+        """
+        loud, _ = self._judge(out="loud")
+        quiet, document = self._judge("--quiet", out="quiet")
+        plain = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--quiet",
+                        env=_env(PATH=""))
+        self.assertIn("--judge claims:", loud.stdout)
+        self.assertNotIn("--judge claims:", quiet.stdout)
+        self.assertEqual(quiet.stdout, plain.stdout)
+        self.assertEqual(quiet.returncode, loud.returncode)
+        self.assertEqual(document["verdict"], "pending-premise")
+        self.assertEqual(document["kernels"], ["python"])
+
 
 def _copy_receipt(destination: Path, *, strip_models: bool = False,
                   model: str | None = None, checker: tuple[str, str] | None = None) -> Path:

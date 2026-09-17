@@ -308,6 +308,13 @@ would otherwise get the four-cell gate's usual PASS with nothing anywhere saying
 the judge it believes is gating never ran. A well-formed `capcov.toml`, and no
 `capcov.toml` at all, are untouched — neither reaches that branch.
 
+`--quiet` governs the opt-in judge as it governs the rest of the command: it
+suppresses the per-op summary and the closing verdict line alike, leaving stdout
+exactly what it is without `--judge claims` at all. Nothing is lost by the
+silence — the verdict, the kernels and the judge's own exit code are in
+`judge.json`, and the process's exit code answers the gate's question either
+way. Diagnostics stay on stderr, which `--quiet` has never governed.
+
 Flow coverage retains the source obligation denominator and checks observed
 outcomes against a reviewed behavior model:
 
