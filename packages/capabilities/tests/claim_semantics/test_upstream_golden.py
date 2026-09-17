@@ -22,6 +22,14 @@ Two documented exceptions, each with its own test rather than a silent skip:
   above it carry `cli.py` line numbers that move with any edit.  The `.stderr`
   files that have an `.error_line` are compared through it; the rest are
   compared whole.
+The class states its two preconditions rather than assuming them: the golden was
+recorded on host CPython 3.13 with no extras installed, and on any other
+interpreter it skips with a message naming what it found and where to re-run it
+(the devShell's python312 wraps argparse's subcommand list differently, which
+would read as "our branch moved upstream's default path" when it is nothing of
+the kind).  Two tests outside the class keep those constants tied to the
+fixture's own README, so a skip can never quietly become permanent.
+
 * **`reconcile --help` and `gate --help` list the new opt-in flags.**  A flag
   that exists appears in its command's help -- upstream's own
   `discover --help` lists `--resolver` for exactly this reason.
@@ -35,6 +43,7 @@ import hashlib
 import json
 import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -75,6 +84,33 @@ def _installed_extras() -> list[str]:
 
 INSTALLED_EXTRAS = _installed_extras()
 
+#: The interpreter that recorded the golden, from its README's own table:
+#: CPython 3.13.  argparse's help formatter wraps a subcommand list differently
+#: between feature releases, so `cli/help.stdout` and every other recorded
+#: `--help` is a 3.13 artifact, not a capcov artifact.  Run the class on the
+#: pinned devShell's python312 and it fails on that wrapping alone -- an opaque
+#: byte diff that says "our branch moved upstream's default path" about a
+#: difference upstream's own code would produce too.  Skipped by name instead,
+#: exactly like the extras precondition above: this is a statement about which
+#: interpreter the fixture describes, never a verdict about the branch.
+GOLDEN_PYTHON = (3, 13)
+
+
+def _wrong_interpreter() -> str:
+    if sys.version_info[:2] == GOLDEN_PYTHON:
+        return ""
+    recorded = ".".join(str(part) for part in GOLDEN_PYTHON)
+    running = ".".join(str(part) for part in sys.version_info[:2])
+    return (f"the golden records CPython {recorded}'s argparse help output; this is "
+            f"CPython {running} -- re-run it on host python3 ({recorded}.x)")
+
+
+GOLDEN_PRECONDITION = _wrong_interpreter() or (
+    ("the golden records a run with NO extras installed; this interpreter can import "
+     + ", ".join(INSTALLED_EXTRAS)
+     + " -- re-run it on a bare interpreter (the pinned devShell's python, or host "
+       "python3)") if INSTALLED_EXTRAS else "")
+
 
 def _hidden_path() -> str:
     """The golden's PATH: this interpreter's bindir first, then the system dirs.
@@ -100,11 +136,7 @@ def _options(help_text: str) -> set[str]:
             if token.startswith("--") and len(token) > 2}
 
 
-@unittest.skipIf(
-    INSTALLED_EXTRAS,
-    "the golden records a run with NO extras installed; this interpreter can import "
-    + ", ".join(INSTALLED_EXTRAS)
-    + " -- re-run it on a bare interpreter (the pinned devShell's python, or host python3)")
+@unittest.skipIf(GOLDEN_PRECONDITION, GOLDEN_PRECONDITION)
 class UpstreamGoldenTests(unittest.TestCase):
     """One generate+normalize for the whole class; the comparisons are pure."""
 
@@ -240,6 +272,26 @@ class UpstreamGoldenTests(unittest.TestCase):
         self.assertEqual(top, (GOLDEN / "cli" / "help.stdout").read_text())
         self.assertNotIn("experiment", top)
         self.assertNotIn("claims", top)
+
+
+class GoldenPreconditionsAreTheOnesTheFixtureRecordsTests(unittest.TestCase):
+    """The skip above is only honest while its constants match the README.
+
+    Not skipped with the class: a precondition nobody can read back is how a
+    suite quietly stops running.  These two assertions run on every
+    interpreter, including the one the class skips on.
+    """
+
+    def test_the_readme_names_the_interpreter_the_skip_expects(self) -> None:
+        recorded = re.search(r"CPython \*\*(\d+)\.(\d+)\.", (GOLDEN / "README.md").read_text())
+        self.assertIsNotNone(recorded, "the golden README no longer names its interpreter")
+        self.assertEqual((int(recorded.group(1)), int(recorded.group(2))), GOLDEN_PYTHON)
+
+    def test_the_readme_names_the_extras_the_skip_expects(self) -> None:
+        readme = (GOLDEN / "README.md").read_text()
+        for name in GOLDEN_EXTRAS:
+            with self.subTest(name):
+                self.assertIn(name, readme)
 
 
 if __name__ == "__main__":
