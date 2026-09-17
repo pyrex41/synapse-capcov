@@ -594,11 +594,13 @@ def _judge_evaluators(args: argparse.Namespace, command: str) -> tuple[str, ...]
     Reached only from the claims branch, so naming an evaluator is the second
     half of an opt-in and the import below is behind it.  The default is the
     stdlib kernel alone; ``souffle`` and ``souffle-compiled`` need the Souffle
-    2.5 executable, and asking for one that is not here is refused BEFORE any
-    work with a message that names the tool, where it was looked for, how to
+    2.5 executable, and asking for one that is not here is refused before any
+    judging with a message that names the tool, where it was looked for, how to
     install it and the flag that needs nothing -- the ``--resolver scip``
-    convention.  ``all`` is every evaluator whose tool is present, so it is the
-    one spelling that cannot fail for an absent one.
+    convention.  `reconcile` is the producer of coverage.json and writes it
+    before the judge is reached at all, so "before any judging" is the honest
+    claim, not "before any work".  ``all`` is every evaluator whose tool is
+    present, so it is the one spelling that cannot fail for an absent one.
     """
     from .claims import differential
 
@@ -644,7 +646,7 @@ def _shen_go_binary() -> str | None:
 def _require_shen_go(command: str) -> str:
     """The binary ``--model shen`` needs, or a named refusal that judges nothing.
 
-    The ``--resolver scip`` convention: raised BEFORE any work, naming the tool,
+    The ``--resolver scip`` convention: raised before any judging, naming the tool,
     where it was looked for, how to install it, and what to do instead -- here,
     drop the flag and judge the ``model_*`` files the receipt already carries,
     which needs nothing.
@@ -676,7 +678,7 @@ def _judge_model(args: argparse.Namespace, command: str) -> tuple[str, Path, str
     carry come out unresolved, which is the honest answer.
 
     ``PROFILE:DIR`` is the spelling (``shen:<model dir>`` today), and the
-    profile's runtime is probed here, before any work.
+    profile's runtime is probed here, before any judging.
     """
     value = getattr(args, "model", None)
     source = "--model"
@@ -704,15 +706,39 @@ def _judge_model(args: argparse.Namespace, command: str) -> tuple[str, Path, str
     return profile, Path(directory), _require_shen_go(command)
 
 
-def _judge_setup(args: argparse.Namespace,
-                 command: str) -> tuple[str, tuple[str, ...], tuple[str, Path, str] | None]:
-    """Resolve the engine, the evaluators and the model profile, and refuse an
-    incoherent combination.
+def _judge_out(args: argparse.Namespace, command: str, receipt: Path) -> Path:
+    """Where the claims judge writes, and never inside the evidence it judges.
+
+    The judge's own output directory contains a ``receipt.json`` of its own (its
+    summary document, written by ``replay.join.write_artifacts``).  Pointed at
+    the receipt it just judged it would overwrite the evidence; pointed at a
+    previous ``--judge-out`` it would read that summary as if it were a receipt.
+    Both are refused here, by name, before any judging.
+    """
+    out_dir = Path(getattr(args, "judge_out", None) or JUDGE_OUT_DEFAULT)
+    resolved, evidence = out_dir.resolve(), receipt.resolve()
+    if resolved == evidence or evidence in resolved.parents:
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: --judge-out {out_dir} is the receipt "
+            f"directory {receipt} or inside it; the judge writes its own receipt.json "
+            f"there and would overwrite the evidence it judged. Name a directory "
+            f"outside --receipt."
+        )
+    return out_dir
+
+
+def _judge_setup(
+    args: argparse.Namespace, command: str
+) -> tuple[str, tuple[str, ...], tuple[str, Path, str] | None, Path | None]:
+    """Resolve the engine, the evaluators, the model profile and the output
+    directory, and refuse an incoherent combination.
 
     ``--receipt``, ``--judge-out``, ``--evaluator`` and ``--model`` say nothing
-    to the four-cell judge, so passing them without asking for the claims judge
-    is refused rather than silently ignored: a flag that does nothing is how a
-    gate ends up green for the wrong reason.
+    to the four-cell judge, so passing *any* of them without asking for the
+    claims judge is refused rather than silently ignored -- including a
+    ``--judge-out`` that happens to spell the default, which is why the option
+    defaults to ``None`` and the default is resolved in the claims branch below.
+    A flag that does nothing is how a gate ends up green for the wrong reason.
     """
     engine = _judge_engine(args, command)
     if engine == "claims":
@@ -727,16 +753,17 @@ def _judge_setup(args: argparse.Namespace,
                 f"capcov {command} --judge claims: {receipt} is not a replay receipt "
                 f"directory (no receipt.json in it)"
             )
-        return engine, _judge_evaluators(args, command), _judge_model(args, command)
+        out_dir = _judge_out(args, command, Path(receipt))
+        return engine, _judge_evaluators(args, command), _judge_model(args, command), out_dir
     for flag, value in (("--receipt", getattr(args, "receipt", None)),
-                        ("--judge-out", getattr(args, "judge_out", JUDGE_OUT_DEFAULT)),
+                        ("--judge-out", getattr(args, "judge_out", None)),
                         ("--evaluator", getattr(args, "evaluator", None)),
                         ("--model", getattr(args, "model", None))):
-        if value not in (None, JUDGE_OUT_DEFAULT):
+        if value is not None:
             raise _JudgeUsage(
                 f"capcov {command}: {flag} is only meaningful with --judge claims"
             )
-    return engine, (), None
+    return engine, (), None, None
 
 
 def _run_model_preflight(args: argparse.Namespace, command: str,
@@ -768,7 +795,7 @@ def _run_model_preflight(args: argparse.Namespace, command: str,
     report = modelcheck.preflight(root, out_dir=receipt)
     status = report["status"]
     if status == "unavailable":
-        # probed in _judge_setup before any work; only a racing environment gets here
+        # probed in _judge_setup before any judging; only a racing environment gets here
         print(f"capcov {command} --judge claims: --model {profile}: the checker's runtime "
               f"became unavailable: {report['error']}", file=sys.stderr)
         return 2
@@ -791,21 +818,58 @@ def _run_model_preflight(args: argparse.Namespace, command: str,
     return None
 
 
+def _gated_artifact(path: Path, coverage: dict, four_cell: str,
+                    unexplained: int | None = None) -> dict:
+    """The identity of the artifact the claims verdict was handed, for judge.json.
+
+    A replay receipt names a run of the system under test; a coverage artifact
+    names a source tree.  Neither names the other, so the CLI does not pretend
+    the two are bound -- it records both identities, and the commands require
+    BOTH verdicts.  Without this a judge.json read on its own could be taken for
+    a verdict about whatever artifact happened to be on the command line.
+
+    Digests and counts only, never the producing path: judge artifacts are
+    publishable.
+    """
+    import hashlib
+
+    derived = coverage.get("derived_from") if isinstance(coverage, dict) else None
+    snapshot = derived.get("source_snapshot") if isinstance(derived, dict) else None
+    document: dict = {
+        "kind": "coverage",
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "source_snapshot": snapshot if isinstance(snapshot, dict) else None,
+        "summary": coverage.get("summary") if isinstance(coverage, dict) else None,
+        # what the artifact's own judge said; the claims verdict is recorded
+        # beside it, never instead of it
+        "four_cell": four_cell,
+    }
+    if unexplained is not None:
+        document["four_cell_unexplained"] = unexplained
+    return document
+
+
 def _run_claims_judge(args: argparse.Namespace, command: str,
                       evaluators: tuple[str, ...],
-                      model: tuple[str, Path, str] | None = None) -> int:
+                      model: tuple[str, Path, str] | None = None,
+                      out_dir: Path | None = None,
+                      gated: dict | None = None) -> int:
     """Judge the receipt with the claims judge and collapse its verdict to pass/fail.
 
     The one place `capcov.cli` reaches into `capcov.claims`, and it is reached
     only from the `claims` branch, so the default path never imports it.
 
-    Every evaluator was resolved and checked in `_judge_setup`, BEFORE any work:
-    an asked-for kernel whose tool is absent is a named, actionable exit 2 there
-    -- the convention `capcov discover --resolver scip` set for a missing
+    Every evaluator was resolved and checked in `_judge_setup`, before any
+    judging: an asked-for kernel whose tool is absent is a named, actionable exit
+    2 there -- the convention `capcov discover --resolver scip` set for a missing
     indexer -- never a quiet degradation to a smaller differential here. The
     judge's own six exit codes are written into judge.json; what the CLI returns
     is 0 when every op the verdict turns on is qualified and 1 otherwise,
     because `gate` answers one question.
+
+    ``gated`` is the identity of the artifact the calling command judged with
+    its own judge, recorded into judge.json so the receipt's verdict is never
+    readable as a verdict about that artifact.  The caller combines the two.
     """
     from .claims.replay import judge as claims_judge
 
@@ -814,7 +878,7 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
         if refusal is not None:
             return refusal
     receipt = Path(args.receipt)
-    out_dir = Path(args.judge_out)
+    out_dir = Path(out_dir if out_dir is not None else (args.judge_out or JUDGE_OUT_DEFAULT))
     try:
         document, diagnostics = claims_judge.judge_receipt(receipt, out_dir, [],
                                                            evaluators=evaluators)
@@ -827,6 +891,18 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
         raise SystemExit(
             f"capcov {command} --judge claims: judge environment unavailable: {error}"
         )
+    if gated is not None:
+        # written after the judge, over the document it wrote: what the judge
+        # decided is about the receipt, and this says what it was asked about
+        # beside.  Every judge_receipt path wrote judge.json, so this rewrites
+        # exactly one file, verdict included.
+        document["gated_artifact"] = gated
+        try:
+            claims_judge.write_json(out_dir / claims_judge.JUDGE_FILE, document)
+        except OSError as error:
+            raise SystemExit(
+                f"capcov {command} --judge claims: judge environment unavailable: {error}"
+            )
     if not args.quiet and document["verdict"] in claims_judge.JUDGED_VERDICTS:
         for line in claims_judge.summary_lines(document):
             print(f"capcov {command} --judge claims: {line}")
@@ -844,7 +920,7 @@ def _run_claims_judge(args: argparse.Namespace, command: str,
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
-        engine, evaluators, model = _judge_setup(args, "reconcile")
+        engine, evaluators, model, judge_out = _judge_setup(args, "reconcile")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -932,26 +1008,56 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             )
     # The four-cell reconcile above is unchanged and coverage.json is written
     # either way -- reconcile is the producer of that artifact. What --judge
-    # claims changes is who decides: a successful reconcile hands the verdict to
-    # the replay judge, and a failed one is still reconcile's own answer.
+    # claims adds is a second verdict over a replay receipt: a successful
+    # reconcile runs it, a failed one is reconcile's own answer and runs nothing,
+    # and either way the artifact reconcile just wrote is named by digest in
+    # judge.json so the receipt's verdict is never readable as a verdict on it.
     if engine == "claims" and rc == 0:
-        return _run_claims_judge(args, "reconcile", evaluators, model)
+        out = Path(args.out)
+        gated = (_gated_artifact(out, doc, "reconciled") if out.is_file() else None)
+        return _run_claims_judge(args, "reconcile", evaluators, model, judge_out, gated)
     return rc
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
     try:
-        engine, evaluators, model = _judge_setup(args, "gate")
+        engine, evaluators, model, judge_out = _judge_setup(args, "gate")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
-    # The coverage artifact is read (and so validated as one) under either
-    # judge; what --judge claims replaces is the verdict, not the input.
     coverage = artifacts.read(Path(args.coverage), "coverage")
-    if engine == "claims":
-        return _run_claims_judge(args, "gate", evaluators, model)
     exemptions = Path(args.exemptions) if args.exemptions else None
     failures = gate_mod.gate(coverage, exemptions)
+    rc = _report_gate(args, coverage, failures)
+    if engine != "claims":
+        return rc
+    # `--judge claims` ADDS a verdict; it never speaks for the coverage artifact.
+    # The receipt names a run of the system under test and the artifact names a
+    # source tree, so nothing in either binds them: the gate runs both judges,
+    # records the artifact's identity and its own verdict in judge.json, and
+    # passes only when both pass.  Anything else makes the positional argument
+    # decorative -- any supported receipt would turn any artifact green.
+    judged = _run_claims_judge(args, "gate", evaluators, model, judge_out,
+                               _gated_artifact(Path(args.coverage), coverage,
+                                               "pass" if rc == 0 else "fail",
+                                               len(failures)))
+    if rc != 0:
+        print(
+            "capcov gate --judge claims: the four-cell gate over this coverage "
+            f"artifact failed ({len(failures)} unexplained), so the gate fails "
+            "whatever the receipt says: the claims judge adds a verdict, it does "
+            "not replace the artifact's",
+            file=sys.stderr,
+        )
+    return 0 if rc == 0 and judged == 0 else 1
+
+
+def _report_gate(args: argparse.Namespace, coverage: dict, failures: list) -> int:
+    """The four-cell gate's own answer, printed exactly as it always was.
+
+    Split out of `cmd_gate` so it runs under either judge: the artifact's own
+    verdict is not something an opt-in flag may skip.
+    """
     if not failures:
         s = coverage["summary"]
         print(
@@ -1073,8 +1179,9 @@ def main(argv: list[str] | None = None) -> int:
         )
         p.add_argument(
             "--judge-out",
-            default=JUDGE_OUT_DEFAULT,
-            help="where --judge claims writes judge.json and the certificates",
+            default=None,
+            help="where --judge claims writes judge.json and the certificates "
+            "(default: capcov-judge); must be outside --receipt",
         )
 
     d = sub.add_parser("discover", help="static: entities, surfaces, bindings")

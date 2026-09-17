@@ -31,7 +31,7 @@ shrinker, and the three-kernel ask through ``compare_three``.
 
 ``python`` needs nothing but the standard library.  ``souffle`` and
 ``souffle-compiled`` need the Souffle 2.5 executable (``$SOUFFLE`` or ``souffle``
-on PATH); ``require_evaluators`` names it and how to install it before any work
+on PATH); ``require_evaluators`` names it and how to install it before any judging
 is done, the way ``capcov discover --resolver scip`` names a missing indexer.
 """
 from __future__ import annotations

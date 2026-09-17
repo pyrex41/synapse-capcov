@@ -17,6 +17,13 @@ Two receipts, two answers, and the difference between them is the point:
   question, so this test also pins that the collapse is lossless *on paper*:
   judge.json still carries ``exit_code: 5`` and names the pending premise.
 
+Every gate here but one passes ``--exemptions``, because ``--judge claims`` adds
+a verdict and never replaces the coverage artifact's: the golden artifact fails
+the four-cell gate, so without the exemptions file the exit code would be 1 for
+a reason that has nothing to do with the receipt.  The one exception is
+``test_a_supported_receipt_does_not_speak_for_the_coverage_artifact``, which
+pins exactly that.
+
 These are the *asked-for* kernels: the CLI is invoked with ``--evaluator all``,
 so in the devShell three kernels judge and the differential runs.  The default
 (python alone, no tool at all) is pinned host-side in tests/test_cli_judge.py,
@@ -26,6 +33,7 @@ elsewhere.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -38,6 +46,11 @@ from pathlib import Path
 PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 COVERAGE = FIXTURES / "upstream_golden" / "python_app" / "coverage.json"
+#: Explains every unexplained row in COVERAGE, so the four-cell gate over it
+#: passes and the exit code is the claims judge's verdict alone.  `--judge
+#: claims` ADDS a verdict, so without this every gate below is exit 1 whatever
+#: the receipt says -- which is its own test, right at the top of the class.
+EXEMPTIONS = FIXTURES / "python_app_exemptions.toml"
 SYNTHETIC = FIXTURES / "replay_receipt_min"
 QUALIFIED = FIXTURES / "replay_receipt_target_go_qualified"
 
@@ -49,15 +62,36 @@ class ClaimsJudgeCliTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="capcov-cli-judge-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _gate(self, receipt: Path, out: str, evaluator: str = "all"):
+    def _gate(self, receipt: Path, out: str, evaluator: str = "all", *extra: str):
         proc = subprocess.run(
             [sys.executable, "-m", "capcov", "gate", str(COVERAGE), "--judge", "claims",
+             "--exemptions", str(EXEMPTIONS),
              "--receipt", str(receipt), "--judge-out", str(self.tmp / out),
-             "--evaluator", evaluator],
+             "--evaluator", evaluator, *extra],
             text=True, capture_output=True,
             env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT / "src")})
         document = json.loads((self.tmp / out / "judge.json").read_text())
         return proc, document
+
+    def test_a_supported_receipt_does_not_speak_for_the_coverage_artifact(self) -> None:
+        """The same receipt, the same verdict, no --exemptions: the gate still fails.
+
+        The four-cell gate over COVERAGE fails (4 unexplained), and `--judge
+        claims` adds a verdict rather than replacing it, so the artifact's own
+        judge still decides.  Without this the positional argument would be
+        decorative: any supported receipt would turn any artifact green.
+        """
+        proc = subprocess.run(
+            [sys.executable, "-m", "capcov", "gate", str(COVERAGE), "--judge", "claims",
+             "--receipt", str(SYNTHETIC), "--judge-out", str(self.tmp / "unexempted"),
+             "--evaluator", "all"],
+            text=True, capture_output=True,
+            env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT / "src")})
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        document = json.loads((self.tmp / "unexempted" / "judge.json").read_text())
+        self.assertEqual(document["verdict"], "supported")
+        self.assertEqual(document["gated_artifact"]["four_cell"], "fail")
+        self.assertEqual(document["gated_artifact"]["four_cell_unexplained"], 4)
 
     def test_the_synthetic_receipt_is_supported_and_the_gate_passes(self) -> None:
         proc, document = self._gate(SYNTHETIC, "synthetic")
@@ -98,6 +132,15 @@ class ClaimsJudgeCliTests(unittest.TestCase):
         self.assertTrue(document["pending_ops"])
         self.assertIn("pending", proc.stderr + proc.stdout)
 
+    def test_the_gated_artifact_is_named_in_judge_json(self) -> None:
+        """Three kernels agreeing about a receipt still say nothing about a tree."""
+        _, document = self._gate(SYNTHETIC, "bound")
+        gated = document["gated_artifact"]
+        self.assertEqual(gated["four_cell"], "pass")
+        self.assertEqual(gated["sha256"], hashlib.sha256(COVERAGE.read_bytes()).hexdigest())
+        self.assertEqual(gated["source_snapshot"],
+                         json.loads(COVERAGE.read_text())["derived_from"]["source_snapshot"])
+
     def test_the_judge_writes_its_certificates_beside_judge_json(self) -> None:
         _, _ = self._gate(SYNTHETIC, "artifacts")
         written = {path.name for path in (self.tmp / "artifacts").rglob("*") if path.is_file()}
@@ -110,6 +153,7 @@ class ClaimsJudgeCliTests(unittest.TestCase):
         (broken / "receipt.json").write_text("{not json")
         proc = subprocess.run(
             [sys.executable, "-m", "capcov", "gate", str(COVERAGE), "--judge", "claims",
+             "--exemptions", str(EXEMPTIONS),
              "--receipt", str(broken), "--judge-out", str(self.tmp / "broken-out")],
             text=True, capture_output=True,
             env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT / "src")})

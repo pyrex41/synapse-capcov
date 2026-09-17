@@ -326,8 +326,36 @@ class ReplayJoin:
                 "missing_premises": list(claim.missing_premises)}
 
 
+def _receipt_header(directory: Path) -> dict[str, Any]:
+    """The receipt this join is about, or a contract finding naming what is wrong.
+
+    ``build`` needs ``run`` before the exporter can be asked for anything (it is
+    asked to export *that* run), so the keys the join itself indexes are checked
+    here, by name.  Without this a JSON document that is not a replay receipt --
+    the judge's own output document, which is also called ``receipt.json`` -- got
+    as far as ``receipt["run"]`` and left the CLI with a ``KeyError`` traceback
+    instead of a finding about the evidence.
+    """
+    path = directory / replay_facts.RECEIPT_FILE
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise replay_facts.ExportInputError(
+            f"{replay_facts.RECEIPT_FILE}: not valid JSON ({exc})") from exc
+    if not isinstance(receipt, dict):
+        raise replay_facts.ExportInputError(
+            f"{replay_facts.RECEIPT_FILE}: must be an object")
+    for key in ("run", "nonce", "snapshot"):
+        value = receipt.get(key)
+        if not isinstance(value, str) or not value:
+            raise replay_facts.ExportInputError(
+                f"{replay_facts.RECEIPT_FILE}: {key!r} must be a non-empty string; "
+                f"{str(directory)!r} is not a replay receipt directory")
+    return receipt
+
+
 def build(directory: Path) -> ReplayJoin:
-    receipt = json.loads((directory / replay_facts.RECEIPT_FILE).read_text(encoding="utf-8"))
+    receipt = _receipt_header(directory)
     run = receipt["run"]
     exported = replay_facts.export_bundle(directory, run=run)
     join = ReplayJoin(directory, receipt, run, exported)

@@ -1,6 +1,6 @@
 """`--judge` is opt-in: the default path is upstream's, byte for byte and import for import.
 
-Three properties, one per section below.
+Six properties, one per section below.
 
 1. **Nothing is imported unless asked.**  `capcov.cli` -- and a whole default
    `reconcile`/`gate` run through it -- must leave `sys.modules` free of every
@@ -33,11 +33,26 @@ Three properties, one per section below.
    named as missing -- rather than refused.  Asking for the profile where
    shen-go is absent is the same named exit 2 an absent Souffle gets.
 
+5. **The judge adds a verdict; it never replaces the artifact's.**  `gate` runs
+   the four-cell gate under either judge and passes only when both pass, and
+   `reconcile`/`gate` record the artifact they judged -- by digest, with its
+   source snapshot and its own verdict -- in judge.json.  A receipt names a run
+   of the system under test and a coverage artifact names a source tree; nothing
+   binds them, so a supported receipt must not turn a failing artifact green and
+   judge.json must not read as a verdict about a tree it never saw.
+
+6. **The judge never writes into the evidence, and never reads its own output as
+   evidence.**  `replay.join.write_artifacts` writes a `receipt.json` of the
+   judge's own into `--judge-out`, so a `--judge-out` at or inside `--receipt` is
+   exit 2 before any judging, and a previous `--judge-out` handed back as
+   `--receipt` is a named contract finding rather than a `KeyError` traceback.
+
 The default-path byte-identity of the *artifacts* is pinned separately, against
 upstream's own output, in tests/claim_semantics/test_upstream_golden.py.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -57,6 +72,12 @@ RECEIPT = (PACKAGE_ROOT / "tests" / "claim_semantics" / "fixtures"
 FIXTURES = PACKAGE_ROOT / "tests" / "claim_semantics" / "fixtures"
 MIN_RECEIPT = FIXTURES / "replay_receipt_min"
 MODEL_MIN = FIXTURES / "model_min"
+#: Explains every unexplained row in the golden python_app coverage artifact, so
+#: the four-cell gate over it PASSES.  A test whose subject is the claims judge's
+#: verdict passes this, because `--judge claims` only ADDS a verdict: a gate over
+#: an artifact that fails its own judge is exit 1 whatever the receipt says, and
+#: `TheGateStillGatesTheArtifactTests` below is where that is pinned.
+EXEMPTIONS = FIXTURES / "python_app_exemptions.toml"
 #: The model digest ``replay_receipt_min`` was hand-built around, and the digest
 #: the committed ``model_min`` sources actually hash to.  ``_receipt_for_model_min``
 #: rewrites the first into the second so the receipt names the model that is in
@@ -647,8 +668,13 @@ class NoModelProfileJudgesWhatTheReceiptCarriesTests(unittest.TestCase):
                 self.assertIn("model_writes", entry["op_qualified"]["missing_premises"])
 
     def test_the_same_receipt_with_its_certificate_is_supported(self) -> None:
-        """The control: only the model premises were missing above."""
+        """The control: only the model premises were missing above.
+
+        Gated with --exemptions so the coverage artifact passes its own judge and
+        the exit code is the claims judge's answer alone.
+        """
         proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--exemptions", str(EXEMPTIONS),
                        "--receipt", str(MIN_RECEIPT), "--judge-out", str(self.tmp / "intact"))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
@@ -674,7 +700,10 @@ class ModelProfilePreflightTests(unittest.TestCase):
         self.digest = modelcheck.model_digest(MODEL_MIN)
 
     def _gate(self, receipt: Path, out: str, *extra: str):
+        # --exemptions makes the four-cell gate over the golden artifact pass, so
+        # the exit code here is the JUDGE's verdict and nothing else
         proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--exemptions", str(EXEMPTIONS),
                        "--receipt", str(receipt), "--judge-out", str(self.tmp / out), *extra)
         return proc, json.loads((self.tmp / out / "judge.json").read_text())
 
@@ -724,6 +753,205 @@ class ModelProfilePreflightTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
         self.assertIn("contract finding", proc.stderr)
         self.assertIn("the certificate is for another model", proc.stderr)
+
+
+class TheGateStillGatesTheArtifactTests(unittest.TestCase):
+    """`--judge claims` ADDS a verdict; the coverage artifact keeps its own.
+
+    The positional argument is not decorative.  A receipt names a run of the
+    system under test and a coverage artifact names a source tree; nothing in
+    either binds them, so a supported receipt must never turn a failing artifact
+    green.  `gate` runs the four-cell gate under either judge and passes only
+    when both pass, and judge.json records the artifact it was handed -- by
+    digest, never by path -- so the receipt's verdict cannot be read as a verdict
+    about that tree.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-judge-binding-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_a_supported_receipt_does_not_rescue_a_failing_coverage_artifact(self) -> None:
+        out = self.tmp / "unrescued"
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(MIN_RECEIPT), "--judge-out", str(out))
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        # the artifact's own judge ran and said no, in the words it always used
+        self.assertIn("capcov gate: FAIL -- 4 unexplained", proc.stdout)
+        self.assertIn("does not replace the artifact's", proc.stderr)
+        document = json.loads((out / "judge.json").read_text())
+        # ... and the claims judge said yes, which is recorded and not obeyed
+        self.assertEqual(document["verdict"], "supported")
+        self.assertEqual(document["exit_code"], 0)
+        self.assertEqual(document["gated_artifact"]["four_cell"], "fail")
+        self.assertEqual(document["gated_artifact"]["four_cell_unexplained"], 4)
+
+    def test_both_verdicts_pass_and_the_gate_passes(self) -> None:
+        """The control: the same receipt over an artifact that passes its own judge."""
+        out = self.tmp / "both"
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--exemptions", str(EXEMPTIONS),
+                       "--receipt", str(MIN_RECEIPT), "--judge-out", str(out))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("capcov gate: PASS", proc.stdout)
+        document = json.loads((out / "judge.json").read_text())
+        self.assertEqual(document["verdict"], "supported")
+        self.assertEqual(document["gated_artifact"]["four_cell"], "pass")
+        self.assertEqual(document["gated_artifact"]["four_cell_unexplained"], 0)
+
+    def test_judge_json_names_the_artifact_by_digest_and_no_path(self) -> None:
+        out = self.tmp / "named"
+        _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                "--receipt", str(MIN_RECEIPT), "--judge-out", str(out))
+        document = json.loads((out / "judge.json").read_text())
+        gated = document["gated_artifact"]
+        self.assertEqual(gated["kind"], "coverage")
+        self.assertEqual(gated["sha256"], hashlib.sha256(
+            (PYTHON_APP / "coverage.json").read_bytes()).hexdigest())
+        coverage = json.loads((PYTHON_APP / "coverage.json").read_text())
+        self.assertEqual(gated["source_snapshot"],
+                         coverage["derived_from"]["source_snapshot"])
+        self.assertEqual(gated["summary"], coverage["summary"])
+        # the public-repo rule the other judge artifacts follow
+        self.assertNotIn(str(PACKAGE_ROOT), (out / "judge.json").read_text())
+
+    def test_reconcile_records_the_artifact_it_just_wrote(self) -> None:
+        """reconcile produces the artifact, so the judge names the bytes it produced."""
+        coverage = self.tmp / "coverage.json"
+        out = self.tmp / "reconciled"
+        proc = _capcov("reconcile", str(PYTHON_APP / "capabilities.json"),
+                       str(PYTHON_APP / "observed.json"), "--out", str(coverage),
+                       "--judge", "claims", "--receipt", str(MIN_RECEIPT),
+                       "--judge-out", str(out))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        gated = json.loads((out / "judge.json").read_text())["gated_artifact"]
+        self.assertEqual(gated["four_cell"], "reconciled")
+        self.assertEqual(gated["sha256"],
+                         hashlib.sha256(coverage.read_bytes()).hexdigest())
+
+
+class JudgeOutIsNeverInsideTheEvidenceTests(unittest.TestCase):
+    """The judge writes a receipt.json of its own, so it may not write into a receipt.
+
+    Two ways that bites, both refused before any judging: `--judge-out` pointed at
+    (or inside) `--receipt` would overwrite the evidence with the judge's summary,
+    and a previous `--judge-out` passed as `--receipt` would be read as evidence.
+    The second is a contract finding about the evidence -- never a traceback.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-judge-out-"))
+        self.receipt = _copy_receipt(self.tmp / "receipt")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _digest(self) -> str:
+        return hashlib.sha256((self.receipt / "receipt.json").read_bytes()).hexdigest()
+
+    def test_judge_out_equal_to_the_receipt_is_refused_and_touches_nothing(self) -> None:
+        before = self._digest()
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(self.receipt), "--judge-out", str(self.receipt))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("would overwrite the evidence it judged", proc.stderr)
+        self.assertEqual(self._digest(), before, "the evidence was rewritten")
+
+    def test_judge_out_inside_the_receipt_is_refused(self) -> None:
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(self.receipt),
+                       "--judge-out", str(self.receipt / "judge"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("inside it", proc.stderr)
+        self.assertFalse((self.receipt / "judge").exists())
+
+    def test_a_previous_judge_out_is_not_a_receipt_it_is_a_contract_finding(self) -> None:
+        out = self.tmp / "first"
+        first = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                        "--receipt", str(self.receipt), "--judge-out", str(out))
+        self.assertEqual(first.returncode, 1, first.stdout + first.stderr)
+        self.assertTrue((out / "receipt.json").is_file(),
+                        "the judge writes a receipt.json of its own -- that is the trap")
+        second = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                         "--receipt", str(out), "--judge-out", str(self.tmp / "second"))
+        self.assertEqual(second.returncode, 1, second.stdout + second.stderr)
+        self.assertIn("contract finding", second.stderr)
+        self.assertIn("is not a replay receipt directory", second.stderr)
+        self.assertNotIn("Traceback", second.stderr)
+
+
+class _StubReport:
+    """The one shape `judge_document` reads off a kernel report."""
+
+    def __init__(self, backend: str, digest: str) -> None:
+        self.backend, self.canonical_digest = backend, digest
+        self.operational_failure = None
+        self.claims: list = []
+
+
+class _StubDisagreement:
+    """Two kernels that ran and did not agree -- what `evaluate_join` returns as `mismatch`."""
+
+    evaluators = ("python", "souffle")
+    differential = "ran"
+    closure_digest_equal = False
+    timings = {"python": 0.0, "souffle": 0.0}
+    reports = (_StubReport("python", "a" * 64), _StubReport("souffle", "b" * 64))
+
+
+class KernelDisagreementIsExitTwoTests(unittest.TestCase):
+    """Kernels that disagree are exit 2 and no verdict -- and the gate fails.
+
+    Nothing else in the suite reaches that branch (the kernels agree on every
+    committed fixture, which is the point of them), so without this a deleted
+    mismatch branch would fall through to "no op was replayed" -- exit 1, a
+    claim about the receipt -- and every test would still pass.  The
+    disagreement is injected rather than provoked: no souffle here.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-kernel-mismatch-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        sys.path.insert(0, str(SRC))
+        self.addCleanup(sys.path.remove, str(SRC))
+        from capcov.claims.replay import judge as claims_judge
+
+        self.judge = claims_judge
+        original = claims_judge.replay_join.evaluate_join
+
+        def disagree(join, *args, **kwargs):
+            join.result, join.mismatch = None, _StubDisagreement()
+            join.evaluators, join.differential = _StubDisagreement.evaluators, "ran"
+            return join
+
+        claims_judge.replay_join.evaluate_join = disagree
+        self.addCleanup(setattr, claims_judge.replay_join, "evaluate_join", original)
+
+    def test_the_judge_reports_kernel_mismatch_exit_two_and_judges_no_op(self) -> None:
+        out = self.tmp / "mismatch"
+        document, diagnostics = self.judge.judge_receipt(MIN_RECEIPT, out, [])
+        self.assertEqual(document["verdict"], self.judge.VERDICT_KERNEL_MISMATCH)
+        self.assertEqual(document["exit_code"], self.judge.EXIT_KERNEL)
+        self.assertEqual(document["ops"], {}, "a disagreement is never a per-op verdict")
+        self.assertFalse(document["differential_report"]["matched"])
+        self.assertTrue(any("kernels disagree" in line for line in diagnostics), diagnostics)
+        self.assertEqual(json.loads((out / "judge.json").read_text())["exit_code"],
+                         self.judge.EXIT_KERNEL)
+
+    def test_the_cli_fails_the_gate_and_never_passes_it(self) -> None:
+        """Even over an artifact whose own gate passes: the judge reached no verdict."""
+        import contextlib
+        import io
+
+        from capcov.cli import main
+
+        out = self.tmp / "cli"
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
+            rc = main(["gate", str(PYTHON_APP / "coverage.json"), "--exemptions",
+                       str(EXEMPTIONS), "--judge", "claims", "--receipt", str(MIN_RECEIPT),
+                       "--judge-out", str(out), "--quiet"])
+        self.assertEqual(rc, 1, buffer.getvalue())
+        self.assertEqual(json.loads((out / "judge.json").read_text())["verdict"],
+                         self.judge.VERDICT_KERNEL_MISMATCH)
 
 
 if __name__ == "__main__":
