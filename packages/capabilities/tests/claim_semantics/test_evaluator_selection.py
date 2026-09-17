@@ -21,6 +21,7 @@ Nothing here skips for an absent Soufflé except the class that is about Souffl�
 """
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import shutil
@@ -255,6 +256,75 @@ class EvaluatorResolutionTests(unittest.TestCase):
         self.assertIsNone(result.souffle)
         self.assertIsNone(result.compiled)
         self.assertEqual([report.backend for report in result.reports], ["python"])
+
+
+class SouffleIsWaitedForNeverFailedFor(unittest.TestCase):
+    """The other half of ``--evaluator``: no suite may *fail* for an absent kernel.
+
+    Choosing the kernels is only half optional if the suites that exercise the
+    Soufflé ones report failures on a plain checkout -- a reviewer reading nine
+    red lines cannot tell "the tool is not installed" from "the kernels
+    disagree", which is the one distinction this whole line is about.  So the
+    Soufflé-only suites must declare their dependence as a *skip*, and these
+    assertions hold in both environments: with the interpreter present nothing
+    is skipped, without it everything Soufflé-only is, by name.
+
+    Deliberately checked through ``__unittest_skip__`` rather than by running
+    the suites: running them proves nothing on a host that has no souffle, and
+    costs a compile on one that does.
+    """
+
+    @staticmethod
+    def _suite(name: str):
+        try:
+            return importlib.import_module(f"tests.claim_semantics.{name}")
+        except ImportError:  # unittest discover -s imports this directory as top-level
+            return importlib.import_module(name)
+
+    def test_the_three_kernel_receipt_suites_wait_for_the_interpreter(self) -> None:
+        """Both classes of the compiled-kernel module, which judge the same receipts."""
+        absent = shutil.which("souffle") is None
+        module = self._suite("test_souffle_compiled_kernel")
+        for name in ("SouffleCompiledCorpusTests", "TargetGoReceiptThreeKernelsTests"):
+            with self.subTest(suite=name):
+                cls = getattr(module, name)
+                self.assertEqual(getattr(cls, "__unittest_skip__", False), absent,
+                                 "a suite that is only about the souffle kernels skips "
+                                 "when souffle is absent and runs when it is here")
+                self.assertIn("souffle", getattr(cls, "__unittest_skip_why__", "souffle"),
+                              "the skip names the tool it is waiting for")
+
+    def test_the_kernel_boundary_keeps_its_python_half_without_the_interpreter(self) -> None:
+        """The split: python's boundary is checked everywhere, souffle's waits."""
+        module = self._suite("test_kernel_closure")
+        cls = module.KernelClosureTests
+        self.assertFalse(getattr(cls, "__unittest_skip__", False),
+                         "the kernel-closure suite is mostly python and never skips wholesale")
+        python_half = cls.test_forall_context_alias_is_rejected_by_the_python_kernel_boundary
+        souffle_half = cls.test_forall_context_alias_is_rejected_by_the_souffle_kernel_boundary
+        self.assertFalse(getattr(python_half, "__unittest_skip__", False))
+        self.assertEqual(getattr(souffle_half, "__unittest_skip__", False),
+                         shutil.which("souffle") is None)
+
+    def test_the_receipts_those_suites_certify_are_covered_here_without_souffle(self) -> None:
+        """Skipping is only honest because this module judges the same fixtures.
+
+        ``TargetGoReceiptThreeKernelsTests`` judges the qualified and unqualified
+        receipts; both are in ``RECEIPTS`` above and are held to the recorded
+        table by the python-only class, so the skip moves coverage rather than
+        dropping it.
+        """
+        module = self._suite("test_souffle_compiled_kernel")
+        try:
+            from .target_go import replay_join
+        except ImportError:
+            from target_go import replay_join
+        for directory in (replay_join.COMMITTED_RECEIPT_DIR,
+                          replay_join.UNQUALIFIED_RECEIPT_DIR):
+            with self.subTest(receipt=directory.name):
+                self.assertIn(Path(directory).resolve(),
+                              {path.resolve() for path in RECEIPTS.values()})
+        self.assertTrue(hasattr(module, "TargetGoReceiptThreeKernelsTests"))
 
 
 class AssumptionsCliEvaluatorTests(unittest.TestCase):
