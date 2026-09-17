@@ -14,10 +14,15 @@ Three properties, one per section below.
    2 with a named message.  Exit 2 is argparse's code for "your command line
    does not name a run"; it is never a claim about the system under test.
 
-3. **The tool is named when it is absent.**  With the Souffle interpreter off
-   PATH, `--judge claims` fails with a message naming `souffle` and how to get
-   it, and writes nothing -- the shape `capcov discover --resolver scip` uses
-   for a missing indexer.
+3. **An optional kernel is asked for by name, and named when it is absent.**
+   `--judge claims` alone judges with the stdlib Python evaluator and needs no
+   tool at all; `--evaluator souffle` (or `souffle-compiled`, or the capcov.toml
+   key) with the interpreter off PATH exits 2 with a message naming the binary,
+   where it was looked for, how to install it and the flag that needs nothing --
+   the shape `capcov discover --resolver scip` uses for a missing indexer -- and
+   writes no judge artifacts.  A judge that ran one kernel says so in
+   judge.json (`kernels: ["python"]`, `differential: not-run (single
+   evaluator)`) rather than reporting a differential it did not run.
 
 The default-path byte-identity of the *artifacts* is pinned separately, against
 upstream's own output, in tests/claim_semantics/test_upstream_golden.py.
@@ -239,21 +244,60 @@ class DefaultJudgeIsTodaysBehaviorTests(unittest.TestCase):
 @unittest.skipIf(shutil.which("souffle") is not None,
                  "this pins the message when souffle is ABSENT; it is on PATH here")
 class AbsentToolIsNamedTests(unittest.TestCase):
-    """The `--resolver scip` convention: name the tool, name the fix, judge nothing."""
+    """The `--resolver scip` convention: name the tool, name the fix, judge nothing.
+
+    Only for an evaluator that was *asked for*.  The default judge is the stdlib
+    Python kernel, which is why `DefaultEvaluatorNeedsNoToolTests` below judges
+    the same receipt in this very environment and gets an answer.
+    """
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="capcov-judge-absent-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
+    def _refusal(self, *extra: str, out: Path | None = None):
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(out or self.tmp / "judge"),
+                       *extra)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("capcov gate --judge claims:", proc.stderr)
+        self.assertIn("Install it with:", proc.stderr)
+        self.assertIn("or use --evaluator python", proc.stderr)
+        return proc
+
     def test_gate_names_souffle_and_writes_no_judge_artifacts(self) -> None:
         out = self.tmp / "judge"
-        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
-                       "--receipt", str(RECEIPT), "--judge-out", str(out))
-        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("capcov gate --judge claims:", proc.stderr)
-        self.assertIn("souffle", proc.stderr)
-        self.assertIn("Install it with:", proc.stderr)
+        proc = self._refusal("--evaluator", "souffle", out=out)
+        self.assertIn("--evaluator souffle needs the Souffle 2.5 executable", proc.stderr)
+        self.assertIn("not on PATH or $SOUFFLE", proc.stderr)
         self.assertFalse(out.exists(), "a refused judge must leave no artifacts behind")
+
+    def test_the_compiled_evaluator_names_the_same_binary(self) -> None:
+        proc = self._refusal("--evaluator", "souffle-compiled")
+        self.assertIn("--evaluator souffle-compiled needs the Souffle 2.5 executable",
+                      proc.stderr)
+
+    def test_a_comma_list_is_refused_on_the_first_evaluator_that_is_absent(self) -> None:
+        proc = self._refusal("--evaluator", "python,souffle-compiled")
+        self.assertIn("--evaluator souffle-compiled needs", proc.stderr)
+
+    def test_the_capcov_toml_evaluator_key_is_refused_the_same_way(self) -> None:
+        (self.tmp / "capcov.toml").write_text('[judge]\nevaluator = "souffle"\n')
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(self.tmp / "judge"),
+                       cwd=self.tmp)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--evaluator souffle needs", proc.stderr)
+
+    def test_all_is_never_refused_for_an_absent_tool(self) -> None:
+        """`all` means every evaluator that is here, so here it means python alone."""
+        out = self.tmp / "all"
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(out),
+                       "--evaluator", "all")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        document = json.loads((out / "judge.json").read_text())
+        self.assertEqual(document["kernels"], ["python"])
 
     def test_reconcile_still_wrote_its_own_artifact_before_the_judge_refused(self) -> None:
         """reconcile is the producer of coverage.json under either judge."""
@@ -261,10 +305,98 @@ class AbsentToolIsNamedTests(unittest.TestCase):
         proc = _capcov("reconcile", str(PYTHON_APP / "capabilities.json"),
                        str(PYTHON_APP / "observed.json"), "--out", str(coverage),
                        "--judge", "claims", "--receipt", str(RECEIPT),
-                       "--judge-out", str(self.tmp / "judge"))
+                       "--evaluator", "souffle", "--judge-out", str(self.tmp / "judge"))
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--evaluator souffle needs", proc.stderr)
+        # the refusal is a command-line refusal, raised before reconcile does its
+        # own work: nothing is written, not even the artifact reconcile produces
+        self.assertFalse(coverage.exists())
+
+
+class EvaluatorUsageRefusalTests(unittest.TestCase):
+    """Naming a kernel that does not exist, or naming one where it says nothing."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-evaluator-usage-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def test_an_unknown_evaluator_exits_two_and_lists_the_choices(self) -> None:
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--evaluator", "datalog-by-hand")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("unknown evaluator 'datalog-by-hand'", proc.stderr)
+        self.assertIn("python, souffle, souffle-compiled", proc.stderr)
+        self.assertIn("(--evaluator)", proc.stderr)
+
+    def test_all_cannot_be_combined_with_a_name(self) -> None:
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--evaluator", "all,python")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("already means every available evaluator", proc.stderr)
+
+    def test_an_evaluator_without_the_claims_judge_is_refused_not_ignored(self) -> None:
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--evaluator", "python")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("--evaluator is only meaningful with --judge claims", proc.stderr)
+
+    def test_an_unknown_evaluator_in_capcov_toml_names_the_key(self) -> None:
+        (self.tmp / "capcov.toml").write_text('[judge]\nevaluator = "prolog"\n')
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), cwd=self.tmp)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("unknown evaluator 'prolog'", proc.stderr)
+        self.assertIn("[judge] evaluator in capcov.toml", proc.stderr)
+
+
+class DefaultEvaluatorNeedsNoToolTests(unittest.TestCase):
+    """The claims judge with no `--evaluator` judges with the standard library alone.
+
+    This runs wherever the suite runs -- souffle present or not -- because that
+    is the property: the default path of an opt-in feature must not need the
+    opt-in tool.  What it must NOT do is pretend a differential happened.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="capcov-evaluator-default-"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _judge(self, *extra: str, out: str = "judge"):
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(self.tmp / out), *extra,
+                       env=_env(PATH=""))
+        return proc, json.loads((self.tmp / out / "judge.json").read_text())
+
+    def test_the_default_judge_runs_the_python_kernel_with_no_tool_on_path(self) -> None:
+        """PATH is emptied: nothing but the interpreter already running is available."""
+        proc, document = self._judge()
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-        self.assertIn("souffle", proc.stderr)
-        self.assertEqual(json.loads(coverage.read_text())["kind"], "coverage")
+        self.assertEqual(document["kernels"], ["python"])
+        self.assertEqual(document["verdict"], "pending-premise")
+        self.assertEqual(document["exit_code"], 5)
+
+    def test_a_single_evaluator_is_never_recorded_as_a_passed_differential(self) -> None:
+        _, document = self._judge(out="single")
+        self.assertEqual(document["differential"], "not-run (single evaluator)")
+        self.assertIsNone(document["compiled"])
+        self.assertEqual(sorted(document["differential_report"]),
+                         ["closure_digest_equal", "compiled_seconds", "failures",
+                          "interpreter_seconds", "matched", "python_digest", "python_seconds"])
+        # no digest is claimed for a kernel that did not run
+        self.assertNotIn("souffle_digest", document["differential_report"])
+
+    def test_the_capcov_toml_key_selects_the_evaluator(self) -> None:
+        (self.tmp / "capcov.toml").write_text('[judge]\nevaluator = "python"\n')
+        proc = _capcov("gate", str(PYTHON_APP / "coverage.json"), "--judge", "claims",
+                       "--receipt", str(RECEIPT), "--judge-out", str(self.tmp / "keyed"),
+                       cwd=self.tmp)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        document = json.loads((self.tmp / "keyed" / "judge.json").read_text())
+        self.assertEqual(document["kernels"], ["python"])
+
+    def test_the_stdout_line_names_the_kernels_and_the_differential(self) -> None:
+        proc, _ = self._judge(out="stdout")
+        self.assertIn("kernels python", proc.stdout)
+        self.assertIn("differential not-run (single evaluator)", proc.stdout)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
-"""Judge a replay receipt with three claim kernels, one of them a compiled Souffle binary.
+"""Judge a replay receipt with the claim kernels asked for, up to three of them.
 
 Three subcommands, stdlib and ``capcov`` only:
 
-``judge``    build the receipt's combined bundle, compile the rule pack's
-             program, run python / interpreted Souffle / compiled Souffle,
-             certify every claim row from every closure, and write
-             ``receipt.json``, the per-row certificates and ``judge.json``.
-             ``judge`` is the default, so a caller may omit it.
+``judge``    build the receipt's combined bundle, run the evaluators
+             ``--evaluator`` names (default ``python``; ``all`` is every one
+             whose tool is present, which in the pinned devShell is python /
+             interpreted Souffle / compiled Souffle), certify every claim row
+             from every closure, and write ``receipt.json``, the per-row
+             certificates and ``judge.json``.  ``judge`` is the default, so a
+             caller may omit it.
+
+             **A producer repo that gates on three kernels must pass
+             ``--evaluator all``** (or the explicit list): the default judges
+             with the standard library alone, so a checkout with no Souffle
+             still judges rather than failing, and ``judge.json`` records which
+             kernels ran (``kernels``) and whether a differential ran at all
+             (``differential``) so a smaller run can never be mistaken for a
+             passed one.
 ``bench``    time the interpreter against the binary on a synthetic receipt
              scaled from a fixture, and write ``bench.json``.
 ``compile``  compile one rule pack's program and print its ``provenance.json``.
@@ -47,7 +57,14 @@ vacuously ``supported``, which no party has asserted.
 The compiled binary is a third independent evaluator with recorded provenance,
 never a replacement for the interpreter or the Python kernel: a compiled-side
 failure is a named failure, never a fallback, and ``judge`` exits non-zero
-unless all three kernels agree.
+unless every requested kernel agrees.
+
+Asking for a kernel whose tool is absent is exit 4 (``the toolchain is
+unavailable``) with the message that names the binary, where it is looked for
+and how to install it.  That is this script's documented code for exactly this
+condition and a producer repo's build gates on it; the ``capcov`` CLI reports the
+same refusal as exit 2, because there it is a command line that does not name a
+runnable judge rather than a judgement about a receipt.
 """
 from __future__ import annotations
 
@@ -134,16 +151,24 @@ _read_join = replay_judge.read_join
 
 
 def judge(args: argparse.Namespace) -> int:
-    """Judge with three kernels and print the script's reader-facing report.
+    """Judge with the requested kernels and print the script's reader-facing report.
 
     The judgement is ``replay_judge.judge_receipt``; what is left here is where
     each line goes.  The op lines and the verdict line are printed only once the
     receipt was actually judged -- a contract finding, an unavailable toolchain
     or a kernel disagreement has no ops to report and says so on stderr alone.
     """
+    try:
+        evaluators = replay_judge.differential.resolve_evaluators(args.evaluator,
+                                                                 executable=args.souffle)
+    except replay_judge.differential.UnknownEvaluator as exc:
+        # argparse's code for a command line that does not name a run; the
+        # judge's own codes are about the receipt, and this says nothing about it
+        print(f"--evaluator: {exc}", file=sys.stderr)
+        return 2
     document, diagnostics = replay_judge.judge_receipt(
         Path(args.receipt), Path(args.out), list(dict.fromkeys(args.require_supported)),
-        kernels="three", cache_dir=args.cache_dir, executable=args.souffle)
+        evaluators=evaluators, cache_dir=args.cache_dir, executable=args.souffle)
     if document["verdict"] in replay_judge.JUDGED_VERDICTS:
         for line in replay_judge.summary_lines(document):
             print(line)
@@ -277,7 +302,12 @@ def build_parser() -> argparse.ArgumentParser:
     judge_parser.add_argument("--out", required=True, help="where judge.json and the certificates land")
     judge_parser.add_argument("--cache-dir", default=str(DEFAULT_CACHE_DIR),
                               help="compiled-checker cache directory")
-    judge_parser.add_argument("--souffle", default="souffle", help="the souffle executable")
+    judge_parser.add_argument("--souffle", default=None,
+                              help="the souffle executable (default: $SOUFFLE, then 'souffle')")
+    judge_parser.add_argument("--evaluator", default=None, metavar="NAME[,NAME...]",
+                              help="which kernels judge: python (default, stdlib only), souffle, "
+                                   "souffle-compiled, a comma list, or 'all' for every one "
+                                   "present. Two or more run the fail-closed differential")
     judge_parser.add_argument("--require-supported", "--require-op", action="append", default=[],
                               metavar="OP", dest="require_supported",
                               help="an op that must be op_qualified supported/complete "

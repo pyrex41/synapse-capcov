@@ -28,6 +28,12 @@ The assumption registry (``claims/assumptions.py``) is reached the same way::
     capcov experiment claims assumptions registry   --receipt DIR [--out DIR]
     capcov experiment claims assumptions invalidate --receipt DIR --drop ID [--drop ID]
 
+``--evaluator`` chooses the kernels both commands judge with: ``python``
+(the default, standard library only), ``souffle``, ``souffle-compiled``, a
+comma list of them, or ``all`` for every one whose tool is present.  Naming one
+that is not here is a refusal (exit 2) that names the tool and how to install
+it; the default needs nothing, so a bare invocation judges in any checkout.
+
 ``registry`` judges a replay receipt with the target-go join and prints the A2
 registry document; ``invalidate`` additionally withdraws each ``--drop``
 assumption (an ``asm:`` id or the evidence id of an assumption row -- either
@@ -159,7 +165,8 @@ def _assumptions(args: argparse.Namespace) -> int:
     import tempfile
 
     from .assumptions import InvalidationError
-    from .differential import DifferentialMismatch
+    from . import differential as differential_mod
+    from .differential import DifferentialMismatch, EvaluatorMismatch
 
     # --out names a DIRECTORY here (the join's artifacts), so every document
     # below is printed and never written to it -- writing a refusal to --out
@@ -173,6 +180,14 @@ def _assumptions(args: argparse.Namespace) -> int:
     receipt = Path(args.receipt) if args.receipt else None
     if receipt is not None and not _is_receipt_dir(receipt):
         emit({"refusal": "no receipt directory (pass --receipt DIR)"})
+        return 2
+    # the evaluators are resolved and checked before the join is reached, so an
+    # absent souffle is named as an absent souffle wherever the command runs
+    try:
+        evaluators = differential_mod.resolve_evaluators(args.evaluator)
+        differential_mod.require_evaluators(evaluators)
+    except (differential_mod.UnknownEvaluator, differential_mod.EvaluatorUnavailable) as exc:
+        emit({"refusal": str(exc)})
         return 2
     try:
         replay_join = _join_module()
@@ -196,7 +211,7 @@ def _assumptions(args: argparse.Namespace) -> int:
                 emit({"refusal": "the exporter refused the receipt",
                       "contract_findings": list(join.contract_findings)})
                 return 2
-            replay_join.evaluate_join(join, replay_root)
+            replay_join.evaluate_join(join, replay_root, evaluators=evaluators)
             if join.mismatch is not None:
                 keep = True
                 emit({"kernel_mismatch": "the kernels disagree on the join",
@@ -206,7 +221,7 @@ def _assumptions(args: argparse.Namespace) -> int:
             if args.command == "invalidate":
                 document["invalidations"] = [replay_join.invalidate(join, drop, replay_root).as_dict()
                                              for drop in args.drop]
-        except DifferentialMismatch as exc:
+        except (DifferentialMismatch, EvaluatorMismatch) as exc:
             keep = True
             emit({"kernel_mismatch": "the kernels disagree on the withdrawn bundle",
                   "replay": str(exc.result.replay_path)})
@@ -268,6 +283,9 @@ def main(argv: list[str]) -> int:
         command.add_argument("--receipt", default=None, help="replay receipt directory (default: the committed fixture)")
         command.add_argument("--out", default=None, help="write the join artifacts to this directory")
         command.add_argument("--replay-root", default=None, help="differential replay directory for a kernel mismatch")
+        command.add_argument("--evaluator", default=None, metavar="NAME[,NAME...]",
+                             help="kernels to judge with: python (default, stdlib only), souffle, "
+                                  "souffle-compiled, a comma list, or 'all' for every one present")
         if name == "invalidate":
             command.add_argument("--drop", action="append", default=[], required=True, metavar="ID",
                                  help="an asm: id or the evidence id of an assumption row (repeatable)")

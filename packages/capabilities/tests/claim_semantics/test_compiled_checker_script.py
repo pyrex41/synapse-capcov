@@ -10,9 +10,13 @@ refusal path is pinned to its documented exit code -- including exit 5, the
 while the Stage D typed checker does not exist, which a consumer gate must be
 able to tell apart from exit 1.
 
-souffle is a precondition, not a skip.  One compiled binary is shared by every
-case through ``CAPCOV_SOUFFLE_CACHE_DIR``; without it a temp cache compiles
-once for the whole class.
+Every judge invocation here passes ``--evaluator all``, which in the pinned
+devShell is all three kernels -- the script's default is the stdlib Python
+evaluator alone, so a producer repo that gates on three kernels names them, and
+``judge.json`` records which ones ran.  souffle is a precondition of this class,
+not a skip.  One compiled binary is shared by every case through
+``CAPCOV_SOUFFLE_CACHE_DIR``; without it a temp cache compiles once for the
+whole class.
 """
 from __future__ import annotations
 
@@ -34,8 +38,10 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = PACKAGE_ROOT / "scripts" / "compiled_checker.py"
 HEX64 = r"^[0-9a-f]{64}$"
 CACHE_ENV = "CAPCOV_SOUFFLE_CACHE_DIR"
-JUDGE_KEYS = {"schema", "receipt", "pack", "compiled", "kernels", "ops", "required_ops",
+JUDGE_KEYS = {"schema", "receipt", "pack", "compiled", "kernels", "differential",
+              "differential_report", "ops", "required_ops",
               "contract_findings", "verdict", "exit_code", "learn"}
+THREE = ["python", "souffle", "souffle-compiled"]
 # what a verdict that is not plain "supported" adds
 PENDING_KEYS = JUDGE_KEYS | {"unmet_ops", "pending_ops", "message"}
 
@@ -74,7 +80,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         out = self.out(name)
         completed = self.run_script("--receipt", str(receipt), "--out", str(out),
                                     "--cache-dir", str(self.cache), "--souffle", "souffle",
-                                    *extra)
+                                    "--evaluator", "all", *extra)
         return completed, out
 
     def test_the_qualified_receipt_is_pending_the_checker_and_exits_five(self) -> None:
@@ -102,7 +108,9 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["pack"]["rule_count"], 71)
         self.assertRegex(document["pack"]["program_digest"], HEX64)
 
-        kernels = document["kernels"]
+        self.assertEqual(document["kernels"], THREE, "--evaluator all ran every kernel here")
+        self.assertEqual(document["differential"], "ran")
+        kernels = document["differential_report"]
         self.assertTrue(kernels["matched"])
         self.assertTrue(kernels["closure_digest_equal"])
         self.assertEqual(kernels["failures"], {})
@@ -188,10 +196,11 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         named_out = self.out("named")
         named = self.run_script("judge", "--receipt", str(replay_join.COMMITTED_RECEIPT_DIR),
                                 "--out", str(named_out), "--cache-dir", str(self.cache),
-                                "--souffle", "souffle", "--require-supported", "delete-issue")
+                                "--souffle", "souffle", "--evaluator", "all",
+                                "--require-supported", "delete-issue")
         self.assertEqual((bare.returncode, named.returncode), (5, 5), named.stderr[-2000:])
-        stable = ("schema", "receipt", "pack", "compiled", "ops", "required_ops", "verdict",
-                  "exit_code", "contract_findings")
+        stable = ("schema", "receipt", "pack", "compiled", "kernels", "differential", "ops",
+                  "required_ops", "verdict", "exit_code", "contract_findings")
         left = json.loads((bare_out / "judge.json").read_text())
         right = json.loads((named_out / "judge.json").read_text())
         self.assertEqual({k: left[k] for k in stable}, {k: right[k] for k in stable})
@@ -204,7 +213,8 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["verdict"], "not-supported")
         self.assertEqual(document["exit_code"], 1)
         self.assertEqual(document["unmet_ops"], ["delete-issue"])
-        self.assertTrue(document["kernels"]["matched"], "the kernels still agree; the op does not qualify")
+        self.assertTrue(document["differential_report"]["matched"],
+                        "the kernels still agree; the op does not qualify")
         entry = document["ops"]["delete-issue"]
         self.assertEqual(entry["verdict"], "not-supported")
         self.assertEqual(entry["op_qualified"]["semantic"], "unresolved")
@@ -237,7 +247,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["exit_code"], 1)
         self.assertEqual(document["unmet_ops"], ["delete-issue"])
         self.assertEqual(document["ops"]["delete-issue"]["op_qualified"]["semantic"], "unresolved")
-        self.assertTrue(document["kernels"]["matched"], "the kernels still agree")
+        self.assertTrue(document["differential_report"]["matched"], "the kernels still agree")
 
         # the synthetic receipt needs no requirement to be judged supported
         completed, out = self.judge(replay_join.SYNTHETIC_RECEIPT_DIR, "no-requirement-synthetic")
@@ -267,7 +277,8 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         document = json.loads((out / "judge.json").read_text())
         self.assertEqual(document["verdict"], "contract-finding")
         self.assertEqual(document["exit_code"], 3)
-        self.assertIsNone(document["kernels"])
+        self.assertEqual(document["kernels"], [], "no kernel ran: the receipt was refused")
+        self.assertIsNone(document["differential_report"])
         self.assertIsNone(document["compiled"])
         self.assertEqual(document["ops"], {})
         self.assertEqual(len(document["contract_findings"]), 1)
@@ -295,18 +306,53 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertNotIn("contract finding", completed.stderr)
         self.assertNotIn("Traceback", completed.stderr)
 
-    def test_an_absent_souffle_is_unavailable_and_exits_four(self) -> None:
+    def test_an_asked_for_souffle_that_is_absent_is_unavailable_and_exits_four(self) -> None:
+        """Named explicitly, so this is "the tool I asked for is missing", not "use less"."""
         out = self.out("unavailable")
         completed = self.run_script(
             "--receipt", str(replay_join.COMMITTED_RECEIPT_DIR), "--out", str(out),
             "--cache-dir", str(self.cache), "--souffle", "souffle-that-is-not-installed",
+            "--evaluator", "python,souffle,souffle-compiled",
             "--require-supported", "delete-issue")
         self.assertEqual(completed.returncode, 4, completed.stderr[-2000:])
         self.assertIn("toolchain unavailable", completed.stderr)
+        self.assertIn("souffle-that-is-not-installed", completed.stderr)
+        self.assertIn("Install it with:", completed.stderr)
         document = json.loads((out / "judge.json").read_text())
         self.assertEqual(document["verdict"], "unavailable")
         self.assertEqual(document["exit_code"], 4)
+        self.assertEqual(document["kernels"], [])
         self.assertIsNone(document["compiled"])
+
+    def test_the_default_evaluator_judges_with_the_python_kernel_alone(self) -> None:
+        """No --evaluator: the script judges with the standard library and says so.
+
+        The verdict is the same one all three kernels reach (exit 5 on this
+        receipt); what changes is that judge.json names one kernel and records
+        that no differential ran, so a producer gate cannot mistake this run for
+        the three-kernel one it asks for with --evaluator all.
+        """
+        out = self.out("default-evaluator")
+        completed = self.run_script(
+            "--receipt", str(replay_join.COMMITTED_RECEIPT_DIR), "--out", str(out),
+            "--cache-dir", str(self.cache), "--require-supported", "delete-issue")
+        self.assertEqual(completed.returncode, 5, completed.stderr[-2000:])
+        document = json.loads((out / "judge.json").read_text())
+        self.assertEqual(document["kernels"], ["python"])
+        self.assertEqual(document["differential"], "not-run (single evaluator)")
+        self.assertIsNone(document["compiled"], "no binary is compiled for a python-only judge")
+        self.assertEqual(document["verdict"], "pending-premise")
+        self.assertEqual(document["ops"]["delete-issue"]["qualification"],
+                         "pending model_well_formed")
+
+    def test_an_unknown_evaluator_is_a_usage_refusal_and_judges_nothing(self) -> None:
+        out = self.out("unknown-evaluator")
+        completed = self.run_script(
+            "--receipt", str(replay_join.COMMITTED_RECEIPT_DIR), "--out", str(out),
+            "--cache-dir", str(self.cache), "--evaluator", "z3")
+        self.assertEqual(completed.returncode, 2, completed.stderr[-2000:])
+        self.assertIn("unknown evaluator 'z3'", completed.stderr)
+        self.assertFalse(out.exists())
 
     def test_bench_scales_the_receipt_and_records_both_medians(self) -> None:
         out = self.out("bench")

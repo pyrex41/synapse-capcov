@@ -26,8 +26,8 @@ Two documented exceptions, each with its own test rather than a silent skip:
   that exists appears in its command's help -- upstream's own
   `discover --help` lists `--resolver` for exactly this reason.
   `test_reconcile_and_gate_help_gains_only_the_judge_flags` pins the delta to
-  exactly `--judge`, `--receipt`, `--judge-out`: no upstream option lost, no
-  fourth option gained.
+  exactly `--judge`, `--receipt`, `--judge-out`, `--evaluator`: no upstream
+  option lost, no fifth option gained.
 """
 from __future__ import annotations
 
@@ -48,7 +48,7 @@ NORMALIZE = GOLDEN / "normalize.py"
 META = {"README.md", "MANIFEST.json", "generate.py", "normalize.py"}
 # the two commands that gained the opt-in --judge flags; pinned by their own test
 HELP_WITH_JUDGE = {"cli/help_reconcile.stdout", "cli/help_gate.stdout"}
-JUDGE_FLAGS = {"--judge", "--receipt", "--judge-out"}
+JUDGE_FLAGS = {"--judge", "--receipt", "--judge-out", "--evaluator"}
 
 
 def _hidden_path() -> str:
@@ -149,7 +149,7 @@ class UpstreamGoldenTests(unittest.TestCase):
                                  (GOLDEN / name).read_bytes())
 
     def test_reconcile_and_gate_help_gains_only_the_judge_flags(self) -> None:
-        """The one allowed delta, and it is exactly three opt-in flags wide."""
+        """The one allowed delta, and it is exactly these opt-in flags wide."""
         for name in sorted(HELP_WITH_JUDGE):
             with self.subTest(name):
                 upstream = _options((GOLDEN / name).read_text())

@@ -120,9 +120,9 @@ binary dropped at `src/capcov/scip/vendor/scip`, or `PATH`.
 the default, it is stdlib-only, and it is what runs in CI. `--judge claims`
 swaps in an experimental **replay judge**: instead of asking whether each
 capability was both derived and exercised, it judges a *replay receipt* — a
-recorded run of two systems against the same requests — with two independent
-claim kernels (a Python evaluator and the Souffle interpreter), certifies every
-claim row from both closures, and refuses to answer at all if they disagree.
+recorded run of two systems against the same requests — with the claim kernels
+you name, certifies every claim row from every closure, and refuses to answer at
+all if they disagree.
 
 ```sh
 capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir --judge-out judge/
@@ -136,13 +136,39 @@ artifact paths are relative to:
 ```toml
 [judge]
 engine = "claims"        # "four-cell" (the default) or "claims"
+evaluator = "python"     # "python" (the default), "souffle", "souffle-compiled",
+                         # a comma list, or "all"
 ```
+
+#### Which kernels judge (`--evaluator`)
+
+`--evaluator` names the kernels, and the default is `python` — the evaluator in
+this package, standard library only. It needs no external tool, which is why
+`--judge claims` works in any checkout:
+
+```sh
+capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir     # python alone
+capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir \
+    --evaluator python,souffle                                               # the differential
+capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir \
+    --evaluator all                        # every evaluator whose tool is present
+```
+
+**The differential runs only when two or more evaluators were asked for.** With
+one, there is nothing to compare, and `judge.json` says so rather than reporting
+an agreement: `"kernels": ["python"]`, `"differential": "not-run (single
+evaluator)"`. With two or more it is fail-closed exactly as before — any
+disagreement on the closure, on a claim row, on a certificate or on a recheck
+blocks the judgement and persists the bundle for replay. `all` means every
+evaluator whose tool is *here*, so it is the one spelling that never fails for a
+missing binary; naming `souffle` or `souffle-compiled` explicitly always does.
 
 `reconcile` still writes `coverage.json` either way — it is the producer of that
 artifact, and `--judge claims` changes who decides, not what is produced. The
 judge writes `judge.json` plus the per-row certificates into `--judge-out`
-(default `capcov-judge/`); that document carries the judge's own six exit codes
-(0 qualified, 1 unsupported, 2 kernels disagree, 3 the receipt breaks the
+(default `capcov-judge/`); that document names the kernels that ran (`kernels`),
+whether a differential ran (`differential`), and carries the judge's own six
+exit codes (0 qualified, 1 unsupported, 2 kernels disagree, 3 the receipt breaks the
 exporter's contract, 4 toolchain unavailable, 5 pending a premise nothing can
 satisfy yet), while the CLI itself answers the one question a gate asks: 0 when
 every op the verdict turns on is qualified, 1 otherwise.
@@ -156,26 +182,29 @@ produce byte-identical output to the version before these options existed
 `capcov experiment claims ...` is likewise registered lazily and never appears
 on the default path.
 
-**What fails, and how.** The differential needs the **external** Souffle 2.5
-interpreter — a binary, not a Python package, so as with the SCIP resolver
-there is no extra that can install it (the `judge` and `souffle` markers in
-`pyproject.toml` are empty and documentary). `--judge claims` never degrades to
-a single kernel; it checks first and refuses with a named, actionable message:
+**What fails, and how.** The `souffle` and `souffle-compiled` evaluators need
+the **external** Souffle 2.5 binary (`$SOUFFLE`, else `souffle` on `PATH`) — a
+binary, not a Python package, so as with the SCIP resolver there is no extra
+that can install it (the `judge` and `souffle` markers in `pyproject.toml` are
+empty and documentary). Asking for one that is not here never degrades to a
+smaller differential; it is checked before any work and refused with a named,
+actionable message:
 
 ```
-capcov gate --judge claims: the claims judge needs the Souffle interpreter
-'souffle', which is not on PATH. Install it with: install Souffle 2.5
+capcov gate --judge claims: --evaluator souffle needs the Souffle 2.5 executable
+'souffle', which is not on PATH or $SOUFFLE. Install it with: install Souffle 2.5
 (https://souffle-lang.github.io/install) or enter the pinned devShell with
-`nix develop`
+`nix develop`; or use --evaluator python
 ```
 
 Install it from <https://souffle-lang.github.io/install>, or run `nix develop`
 at the repository root — `flake.nix` pins it. Configuration mistakes are
 separated from verdicts by exit code: `--judge claims` with no `--receipt`, a
-`--receipt` that is not a receipt directory, an unknown `[judge] engine`, or a
-`--receipt`/`--judge-out` passed without `--judge claims` all exit **2** with a
-message naming the mistake, and judge nothing. A flag that silently did nothing
-is how a gate ends up green for the wrong reason.
+`--receipt` that is not a receipt directory, an unknown `[judge] engine`, an
+unknown or absent `--evaluator`, or a `--receipt`/`--judge-out`/`--evaluator`
+passed without `--judge claims` all exit **2** with a message naming the
+mistake, and judge nothing. A flag that silently did nothing is how a gate ends
+up green for the wrong reason.
 
 Flow coverage retains the source obligation denominator and checks observed
 outcomes against a reviewed behavior model:

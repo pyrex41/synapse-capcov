@@ -519,6 +519,10 @@ def _publish_verified(snapshot, out: Path, phase_started: int) -> int:
 JUDGE_ENGINES = ("four-cell", "claims")
 JUDGE_DEFAULT = "four-cell"
 JUDGE_OUT_DEFAULT = "capcov-judge"
+#: Which evaluators the claims judge runs when nobody says: the stdlib kernel
+#: alone, so `--judge claims` needs no optional tool either.  `souffle` and
+#: `souffle-compiled` are asked for by name, exactly like `--resolver scip`.
+JUDGE_EVALUATOR_DEFAULT = "python"
 
 
 class _JudgeUsage(Exception):
@@ -530,33 +534,42 @@ class _JudgeUsage(Exception):
     """
 
 
-def _judge_engine(args: argparse.Namespace, command: str) -> str:
-    """Which judge decides: ``--judge``, then ``[judge] engine``, then four-cell.
+def _judge_block() -> dict:
+    """The working directory's ``[judge]`` table, or an empty one.
 
     `reconcile` and `gate` take artifact paths rather than a project root, so the
     config is read from the working directory those paths are already relative
-    to.  With no flag and no key the answer is ``four-cell`` and nothing under
-    `capcov.claims` is imported -- that is the whole point of the default.
+    to.  Neither command read capcov.toml before these flags existed, so a file
+    that cannot be read or parsed must not turn a working default run into a
+    failure: it is passed over and the defaults stand.
+    """
+    config = Path("capcov.toml")
+    if not config.exists():
+        return {}
+    import tomllib
 
-    Neither command read capcov.toml before this flag existed, so a file that
-    cannot be read or parsed must not turn a working default run into a failure:
-    it is passed over and the default stands.  ``--judge`` on the command line
-    never consults the file at all, so an explicit ask is never lost to one.
+    try:
+        data = tomllib.loads(config.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return {}
+    block = data.get("judge", {})
+    return block if isinstance(block, dict) else {}
+
+
+def _judge_engine(args: argparse.Namespace, command: str) -> str:
+    """Which judge decides: ``--judge``, then ``[judge] engine``, then four-cell.
+
+    With no flag and no key the answer is ``four-cell`` and nothing under
+    `capcov.claims` is imported -- that is the whole point of the default.
+    ``--judge`` on the command line never consults capcov.toml at all, so an
+    explicit ask is never lost to an unreadable one.
     """
     engine = getattr(args, "judge", None)
     source = "--judge"
     if engine is None:
         config = Path("capcov.toml")
-        if config.exists():
-            import tomllib
-
-            try:
-                data = tomllib.loads(config.read_text())
-            except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
-                data = {}
-            block = data.get("judge", {})
-            engine = block.get("engine") if isinstance(block, dict) else None
-            source = f"[judge] engine in {config}"
+        engine = _judge_block().get("engine")
+        source = f"[judge] engine in {config}"
     if engine is None:
         return JUDGE_DEFAULT
     if engine not in JUDGE_ENGINES:
@@ -567,13 +580,49 @@ def _judge_engine(args: argparse.Namespace, command: str) -> str:
     return engine
 
 
-def _judge_setup(args: argparse.Namespace, command: str) -> str:
-    """Resolve the engine and refuse an incoherent combination of judge options.
+def _judge_evaluators(args: argparse.Namespace, command: str) -> tuple[str, ...]:
+    """Which kernels judge: ``--evaluator``, then ``[judge] evaluator``, then python.
 
-    ``--receipt`` and ``--judge-out`` say nothing to the four-cell judge, so
-    passing them without asking for the claims judge is refused rather than
-    silently ignored: a flag that does nothing is how a gate ends up green for
-    the wrong reason.
+    Reached only from the claims branch, so naming an evaluator is the second
+    half of an opt-in and the import below is behind it.  The default is the
+    stdlib kernel alone; ``souffle`` and ``souffle-compiled`` need the Souffle
+    2.5 executable, and asking for one that is not here is refused BEFORE any
+    work with a message that names the tool, where it was looked for, how to
+    install it and the flag that needs nothing -- the ``--resolver scip``
+    convention.  ``all`` is every evaluator whose tool is present, so it is the
+    one spelling that cannot fail for an absent one.
+    """
+    from .claims import differential
+
+    value = getattr(args, "evaluator", None)
+    source = "--evaluator"
+    if value is None:
+        value = _judge_block().get("evaluator")
+        source = "[judge] evaluator in capcov.toml"
+    if value is None:
+        value = JUDGE_EVALUATOR_DEFAULT
+        source = "the default"
+    if not isinstance(value, str) and not isinstance(value, (list, tuple)):
+        raise _JudgeUsage(
+            f"capcov {command} --judge claims: {source} must name evaluators, got {value!r}")
+    try:
+        names = differential.resolve_evaluators(value)
+    except differential.UnknownEvaluator as error:
+        raise _JudgeUsage(f"capcov {command} --judge claims: {error} ({source})") from error
+    try:
+        differential.require_evaluators(names)
+    except differential.EvaluatorUnavailable as error:
+        raise _JudgeUsage(f"capcov {command} --judge claims: {error}") from error
+    return names
+
+
+def _judge_setup(args: argparse.Namespace, command: str) -> tuple[str, tuple[str, ...]]:
+    """Resolve the engine and evaluators, and refuse an incoherent combination.
+
+    ``--receipt``, ``--judge-out`` and ``--evaluator`` say nothing to the
+    four-cell judge, so passing them without asking for the claims judge is
+    refused rather than silently ignored: a flag that does nothing is how a gate
+    ends up green for the wrong reason.
     """
     engine = _judge_engine(args, command)
     if engine == "claims":
@@ -588,39 +637,39 @@ def _judge_setup(args: argparse.Namespace, command: str) -> str:
                 f"capcov {command} --judge claims: {receipt} is not a replay receipt "
                 f"directory (no receipt.json in it)"
             )
-    else:
-        for flag, value in (("--receipt", getattr(args, "receipt", None)),
-                            ("--judge-out", getattr(args, "judge_out", JUDGE_OUT_DEFAULT))):
-            if value not in (None, JUDGE_OUT_DEFAULT):
-                raise _JudgeUsage(
-                    f"capcov {command}: {flag} is only meaningful with --judge claims"
-                )
-    return engine
+        return engine, _judge_evaluators(args, command)
+    for flag, value in (("--receipt", getattr(args, "receipt", None)),
+                        ("--judge-out", getattr(args, "judge_out", JUDGE_OUT_DEFAULT)),
+                        ("--evaluator", getattr(args, "evaluator", None))):
+        if value not in (None, JUDGE_OUT_DEFAULT):
+            raise _JudgeUsage(
+                f"capcov {command}: {flag} is only meaningful with --judge claims"
+            )
+    return engine, ()
 
 
-def _run_claims_judge(args: argparse.Namespace, command: str) -> int:
+def _run_claims_judge(args: argparse.Namespace, command: str,
+                      evaluators: tuple[str, ...]) -> int:
     """Judge the receipt with the claims judge and collapse its verdict to pass/fail.
 
     The one place `capcov.cli` reaches into `capcov.claims`, and it is reached
     only from the `claims` branch, so the default path never imports it.
 
-    The Souffle interpreter is checked BEFORE any work, and its absence is a
-    named, actionable message and a non-zero exit -- the convention
-    `capcov discover --resolver scip` set for a missing indexer. The judge's own
-    six exit codes are written into judge.json; what the CLI returns is 0 when
-    every op the verdict turns on is qualified and 1 otherwise, because `gate`
-    answers one question.
+    Every evaluator was resolved and checked in `_judge_setup`, BEFORE any work:
+    an asked-for kernel whose tool is absent is a named, actionable exit 2 there
+    -- the convention `capcov discover --resolver scip` set for a missing
+    indexer -- never a quiet degradation to a smaller differential here. The
+    judge's own six exit codes are written into judge.json; what the CLI returns
+    is 0 when every op the verdict turns on is qualified and 1 otherwise,
+    because `gate` answers one question.
     """
     from .claims.replay import judge as claims_judge
 
     receipt = Path(args.receipt)
-    try:
-        claims_judge.require_tools()
-    except claims_judge.JudgeToolsUnavailable as error:
-        raise SystemExit(f"capcov {command} --judge claims: {error}")
     out_dir = Path(args.judge_out)
     try:
-        document, diagnostics = claims_judge.judge_receipt(receipt, out_dir, [])
+        document, diagnostics = claims_judge.judge_receipt(receipt, out_dir, [],
+                                                           evaluators=evaluators)
     except claims_judge.ReceiptContractFinding as error:
         # the receipt does not meet the exporter's contract: a finding about the
         # evidence, reported as one, never a traceback and never a verdict
@@ -638,14 +687,16 @@ def _run_claims_judge(args: argparse.Namespace, command: str) -> int:
     exit_code = int(document["exit_code"])
     print(
         f"capcov {command} --judge claims: {document['verdict']} "
-        f"(judge exit {exit_code}); wrote {out_dir / claims_judge.JUDGE_FILE}"
+        f"(judge exit {exit_code}); kernels {', '.join(document['kernels']) or '-'}; "
+        f"differential {document['differential']}; "
+        f"wrote {out_dir / claims_judge.JUDGE_FILE}"
     )
     return 0 if exit_code == claims_judge.EXIT_OK else 1
 
 
 def cmd_reconcile(args: argparse.Namespace) -> int:
     try:
-        engine = _judge_setup(args, "reconcile")
+        engine, evaluators = _judge_setup(args, "reconcile")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -736,13 +787,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # claims changes is who decides: a successful reconcile hands the verdict to
     # the replay judge, and a failed one is still reconcile's own answer.
     if engine == "claims" and rc == 0:
-        return _run_claims_judge(args, "reconcile")
+        return _run_claims_judge(args, "reconcile", evaluators)
     return rc
 
 
 def cmd_gate(args: argparse.Namespace) -> int:
     try:
-        engine = _judge_setup(args, "gate")
+        engine, evaluators = _judge_setup(args, "gate")
     except _JudgeUsage as error:
         print(str(error), file=sys.stderr)
         return 2
@@ -750,7 +801,7 @@ def cmd_gate(args: argparse.Namespace) -> int:
     # judge; what --judge claims replaces is the verdict, not the input.
     coverage = artifacts.read(Path(args.coverage), "coverage")
     if engine == "claims":
-        return _run_claims_judge(args, "gate")
+        return _run_claims_judge(args, "gate", evaluators)
     exemptions = Path(args.exemptions) if args.exemptions else None
     failures = gate_mod.gate(coverage, exemptions)
     if not failures:
@@ -841,9 +892,19 @@ def main(argv: list[str] | None = None) -> int:
             choices=JUDGE_ENGINES,
             default=None,
             help="which judge decides: 'four-cell' (default, today's behavior) or "
-            "'claims' (the replay judge over a receipt directory; needs --receipt "
-            "and the souffle interpreter). Falls back to [judge] engine in "
-            "capcov.toml, then four-cell.",
+            "'claims' (the replay judge over a receipt directory; needs --receipt DIR). "
+            "Falls back to [judge] engine in capcov.toml, then four-cell.",
+        )
+        p.add_argument(
+            "--evaluator",
+            default=None,
+            metavar="NAME[,NAME...]",
+            help="which kernels --judge claims runs: 'python' (default, stdlib only), "
+            "'souffle', 'souffle-compiled' (both need the souffle 2.5 executable on "
+            "PATH or $SOUFFLE), a comma list of them, or 'all' for every one present. "
+            "Two or more run the fail-closed differential; one records "
+            "differential 'not-run (single evaluator)'. Falls back to [judge] "
+            "evaluator in capcov.toml, then python.",
         )
         p.add_argument(
             "--receipt",

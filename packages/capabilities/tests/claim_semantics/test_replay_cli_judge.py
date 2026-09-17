@@ -17,8 +17,12 @@ Two receipts, two answers, and the difference between them is the point:
   question, so this test also pins that the collapse is lossless *on paper*:
   judge.json still carries ``exit_code: 5`` and names the pending premise.
 
-souffle is a precondition rather than a skip in the devShell; outside it this
-class skips, because an absent interpreter is pinned elsewhere.
+These are the *asked-for* kernels: the CLI is invoked with ``--evaluator all``,
+so in the devShell three kernels judge and the differential runs.  The default
+(python alone, no tool at all) is pinned host-side in tests/test_cli_judge.py,
+and that the two agree on every verdict is pinned in test_evaluator_selection.py.
+Outside the devShell this class skips, because an absent interpreter is pinned
+elsewhere.
 """
 from __future__ import annotations
 
@@ -45,10 +49,11 @@ class ClaimsJudgeCliTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="capcov-cli-judge-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
-    def _gate(self, receipt: Path, out: str):
+    def _gate(self, receipt: Path, out: str, evaluator: str = "all"):
         proc = subprocess.run(
             [sys.executable, "-m", "capcov", "gate", str(COVERAGE), "--judge", "claims",
-             "--receipt", str(receipt), "--judge-out", str(self.tmp / out)],
+             "--receipt", str(receipt), "--judge-out", str(self.tmp / out),
+             "--evaluator", evaluator],
             text=True, capture_output=True,
             env={**os.environ, "PYTHONPATH": str(PACKAGE_ROOT / "src")})
         document = json.loads((self.tmp / out / "judge.json").read_text())
@@ -59,10 +64,30 @@ class ClaimsJudgeCliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertEqual(document["verdict"], "supported")
         self.assertEqual(document["exit_code"], 0)
-        self.assertTrue(document["kernels"]["matched"])
-        # two kernels on this path: python and the interpreter, no compiled binary
-        self.assertIsNone(document["compiled"])
+        self.assertTrue(document["differential_report"]["matched"])
+        # `all` in the devShell is every evaluator whose tool is here: all three
+        self.assertEqual(document["kernels"], ["python", "souffle", "souffle-compiled"])
+        self.assertEqual(document["differential"], "ran")
+        self.assertIsNotNone(document["compiled"], "the compiled kernel records its binary")
+        self.assertTrue(document["differential_report"]["closure_digest_equal"])
         self.assertIn("supported", proc.stdout)
+
+    def test_the_pairwise_ask_runs_exactly_the_two_kernels_named(self) -> None:
+        """`--evaluator` is a list, not a level: naming two runs two, and no binary is built."""
+        proc, document = self._gate(SYNTHETIC, "pairwise", evaluator="python,souffle")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(document["kernels"], ["python", "souffle"])
+        self.assertEqual(document["differential"], "ran")
+        self.assertIsNone(document["compiled"])
+        self.assertNotIn("compiled_digest", document["differential_report"])
+
+    def test_the_default_ask_runs_the_python_kernel_alone_even_here(self) -> None:
+        """souffle is on PATH and is still not used: the evaluator is chosen, never detected."""
+        proc, document = self._gate(SYNTHETIC, "defaulted", evaluator="python")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertEqual(document["kernels"], ["python"])
+        self.assertEqual(document["differential"], "not-run (single evaluator)")
+        self.assertEqual(document["verdict"], "supported")
 
     def test_the_real_receipt_is_pending_the_checker_and_the_gate_fails(self) -> None:
         proc, document = self._gate(QUALIFIED, "qualified")
