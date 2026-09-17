@@ -114,6 +114,69 @@ error when a tool is absent. Install, per target language:
 capcov finds the indexer on `PATH` and locates the `scip` CLI via `$SCIP_CLI`, a
 binary dropped at `src/capcov/scip/vendor/scip`, or `PATH`.
 
+### Optional profiles (`--judge claims`)
+
+`capcov reconcile` and `capcov gate` judge with the four-cell reconcile. That is
+the default, it is stdlib-only, and it is what runs in CI. `--judge claims`
+swaps in an experimental **replay judge**: instead of asking whether each
+capability was both derived and exercised, it judges a *replay receipt* — a
+recorded run of two systems against the same requests — with two independent
+claim kernels (a Python evaluator and the Souffle interpreter), certifies every
+claim row from both closures, and refuses to answer at all if they disagree.
+
+```sh
+capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir --judge-out judge/
+capcov reconcile capabilities.json observed.json --out coverage.json \
+    --judge claims --receipt <evidence>/receipt-dir
+```
+
+It can also be selected from `capcov.toml`, read from the working directory the
+artifact paths are relative to:
+
+```toml
+[judge]
+engine = "claims"        # "four-cell" (the default) or "claims"
+```
+
+`reconcile` still writes `coverage.json` either way — it is the producer of that
+artifact, and `--judge claims` changes who decides, not what is produced. The
+judge writes `judge.json` plus the per-row certificates into `--judge-out`
+(default `capcov-judge/`); that document carries the judge's own six exit codes
+(0 qualified, 1 unsupported, 2 kernels disagree, 3 the receipt breaks the
+exporter's contract, 4 toolchain unavailable, 5 pending a premise nothing can
+satisfy yet), while the CLI itself answers the one question a gate asks: 0 when
+every op the verdict turns on is qualified, 1 otherwise.
+
+**Off unless asked, exactly like `--resolver scip`.** With no flag and no
+`[judge]` key, `capcov.cli` does not import `capcov.claims` at all — not the
+evaluator, not the rule packs, not the model checker — and `reconcile`/`gate`
+produce byte-identical output to the version before these options existed
+(pinned against upstream's own artifacts in
+`tests/claim_semantics/test_upstream_golden.py`). The experimental namespace
+`capcov experiment claims ...` is likewise registered lazily and never appears
+on the default path.
+
+**What fails, and how.** The differential needs the **external** Souffle 2.5
+interpreter — a binary, not a Python package, so as with the SCIP resolver
+there is no extra that can install it (the `judge` and `souffle` markers in
+`pyproject.toml` are empty and documentary). `--judge claims` never degrades to
+a single kernel; it checks first and refuses with a named, actionable message:
+
+```
+capcov gate --judge claims: the claims judge needs the Souffle interpreter
+'souffle', which is not on PATH. Install it with: install Souffle 2.5
+(https://souffle-lang.github.io/install) or enter the pinned devShell with
+`nix develop`
+```
+
+Install it from <https://souffle-lang.github.io/install>, or run `nix develop`
+at the repository root — `flake.nix` pins it. Configuration mistakes are
+separated from verdicts by exit code: `--judge claims` with no `--receipt`, a
+`--receipt` that is not a receipt directory, an unknown `[judge] engine`, or a
+`--receipt`/`--judge-out` passed without `--judge claims` all exit **2** with a
+message naming the mistake, and judge nothing. A flag that silently did nothing
+is how a gate ends up green for the wrong reason.
+
 Flow coverage retains the source obligation denominator and checks observed
 outcomes against a reviewed behavior model:
 
