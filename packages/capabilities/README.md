@@ -118,11 +118,19 @@ binary dropped at `src/capcov/scip/vendor/scip`, or `PATH`.
 
 `capcov reconcile` and `capcov gate` judge with the four-cell reconcile. That is
 the default, it is stdlib-only, and it is what runs in CI. `--judge claims`
-swaps in an experimental **replay judge**: instead of asking whether each
-capability was both derived and exercised, it judges a *replay receipt* — a
+**adds** an experimental **replay judge** beside it: as well as asking whether
+each capability was both derived and exercised, it judges a *replay receipt* — a
 recorded run of two systems against the same requests — with the claim kernels
 you name, certifies every claim row from every closure, and refuses to answer at
 all if they disagree.
+
+It adds a verdict; it does not replace the artifact's. A receipt names a run of
+the system under test and a coverage artifact names a source tree, and nothing in
+either names the other, so `gate` runs the four-cell gate too and passes only
+when **both** pass, and `judge.json` records the artifact it was handed
+(`gated_artifact`: its sha256, its source snapshot and its four-cell verdict).
+`--judge-out` must be outside `--receipt` — the judge writes a `receipt.json` of
+its own — and is refused by name when it is not.
 
 ```sh
 capcov gate coverage.json --judge claims --receipt <evidence>/receipt-dir --judge-out judge/
