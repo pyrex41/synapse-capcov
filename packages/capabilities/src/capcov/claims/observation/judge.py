@@ -8,6 +8,8 @@ Example::
       --incumbent-manifest /private/prepared-runtime.json \
       --expected-nonce "$CAPTURED_NONCE" \
       --expected-fixture-digest "$CAPTURED_FIXTURE_SHA256" \
+      --invocation-record /private/invocation.json \
+      --expected-invocation-digest "$PRE_RUN_IDENTITY_SHA256" \
       --out-dir /private/judgment
 
 The expected nonce and fixture digest are supplied by the observer. This
@@ -127,7 +129,8 @@ def _check_paths(receipt: Path, candidate: Path, manifest: Path, out_dir: Path,
             raise ValueError(f"external {label} must be outside the receipt directory")
         if out_dir == source or source.is_relative_to(out_dir):
             raise ValueError(f"output directory would contain the external {label}")
-def _strict_json(path: Path, expected_digest: str | None, label: str) -> tuple[dict[str, Any], str]:
+def _strict_json(path: Path, expected_digest: str | None,
+                 label: str) -> tuple[dict[str, Any], str, bytes]:
     raw = path.read_bytes()
     if len(raw) > 1024 * 1024:
         raise ValueError(f"{label} exceeds the 1 MiB input limit")
@@ -146,7 +149,7 @@ def _strict_json(path: Path, expected_digest: str | None, label: str) -> tuple[d
     value = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_object)
     if not isinstance(value, dict):
         raise ValueError(f"{label} must be a JSON object")
-    return value, actual
+    return value, actual, raw
 
 
 def _valid_hex(value: Any, length: int = 64) -> bool:
@@ -277,7 +280,9 @@ def _report(join: observation_join.ObservationJoin,
     document["kernel_execution"] = (
         "not-run" if report is None else
         "operational-failure" if report.operational_failure else "complete")
-    document["python_closure_digest"] = report.canonical_digest if report else None
+    # KernelReport.canonical_digest binds normalized relations and claim
+    # verdicts too; it is a full result identity, not a closure-only digest.
+    document["python_result_digest"] = report.canonical_digest if report else None
     document["source_observed_digest"] = (
         join.source_observation.observed if join.source_observation else None)
     document["source_observed_matches"] = (
@@ -355,7 +360,7 @@ def main(argv: list[str] | None = None) -> int:
         invocation = None
         gate_reason = "external-invocation-record-absent"
         if args.invocation_record is not None:
-            invocation, invocation_file_digest = _strict_json(
+            invocation, invocation_file_digest, _invocation_bytes = _strict_json(
                 args.invocation_record, None, "invocation record")
             invocation_ok, invocation_reason = _validate_invocation(
                 invocation, args.expected_nonce, args.expected_fixture_digest)
@@ -364,8 +369,9 @@ def main(argv: list[str] | None = None) -> int:
                 invocation_ok, invocation_reason = False, "pre-run-invocation-identity-digest-mismatch"
             gate_reason = None if invocation_ok else invocation_reason
         admission_digest = None
+        admission_bytes = None
         if args.admission_record is not None:
-            _admissions, admission_digest = _strict_json(
+            _admissions, admission_digest, admission_bytes = _strict_json(
                 args.admission_record, args.expected_admission_digest, "admission record")
 
         expected_incumbent = (invocation or {}).get("incumbent", {})
@@ -379,7 +385,7 @@ def main(argv: list[str] | None = None) -> int:
             nonce=args.expected_nonce,
             fixture_digest=args.expected_fixture_digest,
             fixture=False,
-            external_admissions_path=args.admission_record,
+            external_admissions_bytes=admission_bytes,
             expected_incumbent_commit=expected_incumbent.get("commit") if can_observe_source else None,
             expected_incumbent_runtime_commit=(expected_incumbent.get("runtime_commit")
                                                if can_observe_source else None),

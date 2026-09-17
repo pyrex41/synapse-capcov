@@ -1513,21 +1513,43 @@ def _check_log(receipt: Mapping[str, Any], receipt_dir: Path, limits: ExportLimi
 def _read_admissions(receipt_dir: Path, policy_digest: str, set_digest: str, check_id: str,
                      limits: ExportLimits, messages: list[str],
                      forbidden: tuple[str, ...], *, admissions_path: Path | None,
+                     admissions_bytes: bytes | None,
                      allow_receipt_admissions: bool) -> tuple[str | None, list[dict[str, Any]]]:
     """Read only externally supplied admissions unless fixture access is explicit."""
+    if admissions_path is not None and admissions_bytes is not None:
+        raise _refuse("R-2", "external admissions must use a path or a byte snapshot, not both")
     path = admissions_path
-    if path is None and allow_receipt_admissions:
+    if path is None and admissions_bytes is None and allow_receipt_admissions:
         path = receipt_dir / ADMISSIONS_FILE
-    if path is None or not path.is_file():
+    if admissions_bytes is None and (path is None or not path.is_file()):
         messages.append("external observation admission record absent: no reviewer admitted "
                         "this comparison policy or scenario set, so the claim has no admission "
                         "to rest on")
         return None, []
-    text = _read_text(path, limits.file_bytes)
+    if admissions_bytes is not None:
+        if len(admissions_bytes) > limits.file_bytes:
+            raise _refuse("R-2", f"{ADMISSIONS_FILE}: {len(admissions_bytes)} bytes exceed the "
+                                   f"{limits.file_bytes}-byte file limit")
+        try:
+            text = admissions_bytes.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _refuse("R-2", f"{ADMISSIONS_FILE}: not valid UTF-8 ({exc})") from exc
+    else:
+        assert path is not None
+        text = _read_text(path, limits.file_bytes)
     _scan_text(text, ADMISSIONS_FILE, forbidden)
+
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            result[key] = value
+        return result
+
     try:
-        ledger = json.loads(text)
-    except json.JSONDecodeError as exc:
+        ledger = json.loads(text, object_pairs_hook=unique_object)
+    except (json.JSONDecodeError, ValueError) as exc:
         raise _refuse("R-2", f"{ADMISSIONS_FILE}: not valid JSON ({exc})") from exc
     ledger = _obj(ledger, ADMISSIONS_FILE)
     unknown = set(ledger) - {"producer", "reviewer", "reviewed_at", "reviewed_against", "rows"}
@@ -1607,6 +1629,7 @@ def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
                   limits: ExportLimits | None = None,
                   forbidden_strings: tuple[str, ...] | None = None,
                   admissions_path: str | Path | None = None,
+                  admissions_bytes: bytes | None = None,
                   allow_receipt_admissions: bool = False) -> ExportResult:
     """Export one observation receipt directory as a validated ``Bundle``.
 
@@ -1619,12 +1642,17 @@ def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
     malformed receipt. Receipt-local admissions are ignored by default. Tests
     for committed golden receipts must opt in with
     ``allow_receipt_admissions=True``; live callers should instead supply an
-    external ``admissions_path`` whose exact bytes they bind independently.
+    external ``admissions_path`` or a previously captured ``admissions_bytes``
+    snapshot whose exact bytes they bind independently.
     """
     receipt_dir = Path(receipt_dir)
-    if admissions_path is not None and allow_receipt_admissions:
+    if ((admissions_path is not None or admissions_bytes is not None)
+            and allow_receipt_admissions):
         return ExportResult(STATUS_INVALID_INPUT, None, {},
                             ("external admissions and fixture receipt admissions are mutually exclusive",))
+    if admissions_path is not None and admissions_bytes is not None:
+        return ExportResult(STATUS_INVALID_INPUT, None, {},
+                            ("external admissions must use a path or a byte snapshot, not both",))
     limits = limits or ExportLimits()
     forbidden = (FORBIDDEN_FORK_STRINGS if forbidden_strings is None
                  else tuple(s.lower() for s in forbidden_strings))
@@ -1796,6 +1824,7 @@ def export_bundle(receipt_dir: str | Path, *, run: str | None = None,
             receipt_dir, policy["digest"], scenario_set["digest"], check["id"], limits,
             messages, forbidden,
             admissions_path=Path(admissions_path) if admissions_path is not None else None,
+            admissions_bytes=admissions_bytes,
             allow_receipt_admissions=allow_receipt_admissions)
         for relation, values in admissions:
             facts.add(relation, values, source=source, depends_on=deps, kind="assumption")

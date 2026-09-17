@@ -397,6 +397,7 @@ def build(directory: Path | str, *, candidate_root: Path | str | None = None,
           fixture_digest: str | None = None, fixture: bool = False,
           allow_receipt_admissions: bool | None = None,
           external_admissions_path: Path | str | None = None,
+          external_admissions_bytes: bytes | None = None,
           expected_incumbent_commit: str | None = None,
           expected_incumbent_runtime_commit: str | None = None,
           expected_manifest_sha256: str | None = None,
@@ -416,12 +417,16 @@ def build(directory: Path | str, *, candidate_root: Path | str | None = None,
     directory = Path(directory)
     if allow_receipt_admissions and not fixture:
         raise ValueError("receipt-local admissions are available only in explicit fixture mode")
+    if external_admissions_path is not None and external_admissions_bytes is not None:
+        raise ValueError("external admissions must use a path or a byte snapshot, not both")
     receipt_admissions = fixture if allow_receipt_admissions is None else allow_receipt_admissions
     receipt = json.loads((directory / observation_facts.RECEIPT_FILE).read_text(encoding="utf-8"))
     run = receipt.get("run", {}).get("id", "")
     exported = observation_facts.export_bundle(
         directory, run=run or None, admissions_path=external_admissions_path,
-        allow_receipt_admissions=receipt_admissions and external_admissions_path is None)
+        admissions_bytes=external_admissions_bytes,
+        allow_receipt_admissions=(receipt_admissions and external_admissions_path is None
+                                  and external_admissions_bytes is None))
     join = ObservationJoin(directory, receipt, run, exported)
     if exported.status != observation_facts.STATUS_COMPLETE:
         join.contract_findings = [f"exporter refused the receipt ({exported.status}): {m}"

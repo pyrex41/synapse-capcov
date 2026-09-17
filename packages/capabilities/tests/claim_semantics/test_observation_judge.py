@@ -171,6 +171,37 @@ class ObservationJudgeCliTest(unittest.TestCase):
             self.assertEqual(report["judge_status"], "invalid-input")
             self.assertNotIn(str(admission), text)
 
+    def test_admission_snapshot_is_consumed_if_path_changes_after_digest_check(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="capcov-observation-cli-") as tmp:
+            root = Path(tmp)
+            args = self._args(root)
+            admission = root / "reviewed-admissions.json"
+            signed = json.loads((AGREE / facts.ADMISSIONS_FILE).read_text(encoding="utf-8"))
+            unsigned = {**signed, "reviewer": "unassigned"}
+            unsigned_bytes = (json.dumps(unsigned, indent=1, sort_keys=True) + "\n").encode("utf-8")
+            signed_bytes = (AGREE / facts.ADMISSIONS_FILE).read_bytes()
+            admission.write_bytes(unsigned_bytes)
+            digest = hashlib.sha256(unsigned_bytes).hexdigest()
+            args.extend(("--admission-record", str(admission),
+                         "--expected-admission-digest", digest))
+            real_build = observation_join.build
+            built = []
+
+            def replace_before_export(directory, **kwargs):
+                admission.write_bytes(signed_bytes)
+                join = real_build(directory, **kwargs)
+                built.append(join)
+                return join
+
+            with patch.object(observation_join, "build", side_effect=replace_before_export):
+                code, report, _text = self._run(args)
+
+            self.assertEqual(code, 5)  # Invocation binding is deliberately absent.
+            self.assertNotEqual(hashlib.sha256(admission.read_bytes()).hexdigest(), digest)
+            self.assertEqual(report["external_bindings"]["admission_record_sha256"], digest)
+            self.assertEqual(built[0].exported.counts.get("policy_admitted", 0), 0)
+            self.assertEqual(built[0].exported.counts.get("scenario_set_admitted", 0), 0)
+
     def test_unverified_fixture_setup_stays_pending(self) -> None:
         with tempfile.TemporaryDirectory(prefix="capcov-observation-cli-") as tmp:
             root = Path(tmp)
@@ -269,7 +300,7 @@ class ObservationJudgeCliTest(unittest.TestCase):
         self.assertEqual(report["kernels"], ["python"])
         self.assertIn("certificate-observations-agree.json", report["certificates"])
         self.assertEqual(report["source_digest"], join.source_digest)
-        self.assertEqual(len(report["python_closure_digest"]), 64)
+        self.assertEqual(len(report["python_result_digest"]), 64)
 
 
 if __name__ == "__main__":
