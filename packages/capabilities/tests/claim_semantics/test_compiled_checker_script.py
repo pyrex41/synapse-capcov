@@ -10,11 +10,17 @@ refusal path is pinned to its documented exit code -- including exit 5, the
 while the Stage D typed checker does not exist, which a consumer gate must be
 able to tell apart from exit 1.
 
-Every judge invocation here passes ``--evaluator all``, which in the pinned
-devShell is all three kernels -- the script's default is the stdlib Python
-evaluator alone, so a producer repo that gates on three kernels names them, and
-``judge.json`` records which ones ran.  souffle is a precondition of this class,
-not a skip.  One compiled binary is shared by every case through
+Every judge invocation here passes ``--evaluator all`` -- every evaluator whose
+tool is present, which is all three kernels in the pinned devShell and the
+stdlib Python kernel alone in a plain checkout.  The script's default is python
+alone, so a producer repo that gates on three kernels names them, and
+``judge.json`` records which ones ran.  Souffle is therefore NOT a precondition
+of this class: the verdict, the exit code and every contract finding are the
+same answer with one kernel as with three, and only the assertions that are
+*about* the interpreter and the compiled binary are skipped by name when it is
+absent (``SOUFFLE_ONLY``).  What is never allowed is a smaller run passing for a
+bigger one, so every case asserts which kernels ran and whether a differential
+ran at all.  One compiled binary is shared by every case through
 ``CAPCOV_SOUFFLE_CACHE_DIR``; without it a temp cache compiles once for the
 whole class.
 """
@@ -29,6 +35,8 @@ import sys
 import tempfile
 import unittest
 
+from capcov.claims.differential import available_evaluators
+
 try:
     from .target_go import replay_join
 except ImportError:  # unittest discover -s imports this directory as top-level
@@ -42,6 +50,11 @@ JUDGE_KEYS = {"schema", "receipt", "pack", "compiled", "kernels", "differential"
               "differential_report", "ops", "required_ops",
               "contract_findings", "verdict", "exit_code", "learn"}
 THREE = ["python", "souffle", "souffle-compiled"]
+HAVE_SOUFFLE = shutil.which("souffle") is not None
+SOUFFLE_ONLY = "this assertion is about the souffle kernels; souffle is not on PATH here"
+#: judge.json writes a digest only for a kernel that ran, under these names
+DIGEST_KEY = {"python": "python_digest", "souffle": "souffle_digest",
+              "souffle-compiled": "compiled_digest"}
 # what a verdict that is not plain "supported" adds
 PENDING_KEYS = JUDGE_KEYS | {"unmet_ops", "pending_ops", "message"}
 
@@ -63,9 +76,41 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         shutil.rmtree(cls.workspace, ignore_errors=True)
 
     def setUp(self) -> None:
-        self.assertIsNotNone(shutil.which("souffle"),
-                             "souffle must be on PATH: run inside the nix devShell")
         self.assertTrue(SCRIPT.is_file(), SCRIPT)
+
+    def expected_kernels(self) -> list[str]:
+        """What ``--evaluator all`` resolves to here: every evaluator present."""
+        return list(available_evaluators())
+
+    def assert_kernels_recorded(self, document: dict) -> None:
+        """Every kernel that ran agreed, and judge.json says which ran and whether.
+
+        Evaluator-agnostic on purpose: with one kernel ``matched`` is vacuous, so
+        it is never asserted alone -- ``differential`` must say ``not-run (single
+        evaluator)`` in that case and ``ran`` only when two or more kernels were
+        there.  A digest for a kernel that did not run would be the smaller run
+        passing for the bigger one, so the digest keys are asserted exactly.
+        """
+        expected = self.expected_kernels()
+        self.assertEqual(document["kernels"], expected,
+                         "--evaluator all runs every kernel present here")
+        self.assertEqual(document["differential"],
+                         "ran" if len(expected) > 1 else "not-run (single evaluator)")
+        report = document["differential_report"]
+        self.assertTrue(report["matched"])
+        self.assertEqual(report["failures"], {})
+        present = [DIGEST_KEY[name] for name in expected]
+        self.assertEqual(sorted(key for key in DIGEST_KEY.values() if key in report),
+                         sorted(present), "no digest is written for a kernel that did not run")
+        self.assertEqual(len({report[key] for key in present}), 1,
+                         "every kernel that ran closed to the same digest")
+        for key in present:
+            self.assertRegex(report[key], HEX64, key)
+        self.assertGreater(report["python_seconds"], 0.0)
+        # the closure digest compares the two Souffle kernels with each other: it
+        # is unknown, not unequal, when fewer than two of them ran
+        self.assertEqual(report["closure_digest_equal"],
+                         True if len(expected) == 3 else None)
 
     def run_script(self, *args: str) -> subprocess.CompletedProcess:
         return subprocess.run([sys.executable, str(SCRIPT), *args], cwd=PACKAGE_ROOT,
@@ -108,18 +153,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["pack"]["rule_count"], 71)
         self.assertRegex(document["pack"]["program_digest"], HEX64)
 
-        self.assertEqual(document["kernels"], THREE, "--evaluator all ran every kernel here")
-        self.assertEqual(document["differential"], "ran")
-        kernels = document["differential_report"]
-        self.assertTrue(kernels["matched"])
-        self.assertTrue(kernels["closure_digest_equal"])
-        self.assertEqual(kernels["failures"], {})
-        self.assertEqual(len({kernels["python_digest"], kernels["souffle_digest"],
-                              kernels["compiled_digest"]}), 1)
-        for field in ("python_digest", "souffle_digest", "compiled_digest"):
-            self.assertRegex(kernels[field], HEX64, field)
-        for field in ("interpreter_seconds", "compiled_seconds", "python_seconds"):
-            self.assertGreater(kernels[field], 0.0, field)
+        self.assert_kernels_recorded(document)
 
         entry = document["ops"]["delete-issue"]
         self.assertEqual(entry["qualification"], "pending model_well_formed")
@@ -143,15 +177,39 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(learn["consistent_ops"], ["delete-issue"])
         self.assertNotIn("delete-issue", learn["unmodeled_ops"])
 
-        self.assertRegex(document["compiled"]["binary_sha256"], HEX64)
-        self.assertEqual(document["compiled"]["schema"], "capcov-souffle-compiled-v1")
-        self.assertEqual(document["compiled"]["program_digest"], document["pack"]["program_digest"])
-
         # the judge writes the join artifacts next to judge.json
         self.assertTrue((out / "receipt.json").is_file())
         certificates = sorted(p.name for p in out.glob("certificate-*.json"))
         self.assertIn("certificate-claim-corpus-constrains-delete-issue.json", certificates)
         self.assertNotIn("certificate-claim-qualified-delete-issue.json", certificates)
+
+    @unittest.skipUnless(HAVE_SOUFFLE, SOUFFLE_ONLY)
+    def test_the_souffle_kernels_run_and_the_compiled_binary_is_provenanced(self) -> None:
+        """What ``--evaluator all`` adds when the interpreter is here: three kernels.
+
+        The verdict is not re-asserted -- the test above already pins it, with
+        whichever kernels this machine has.  What is asserted here is only what a
+        python-only run cannot say: that all three kernels ran, that a
+        differential really ran, that the two Souffle kernels closed to the same
+        digest, and that the compiled binary is the pack's own program.
+        """
+        completed, out = self.judge(replay_join.COMMITTED_RECEIPT_DIR, "three-kernels",
+                                    "--require-supported", "delete-issue")
+        self.assertEqual(completed.returncode, 5, completed.stderr[-2000:])
+        document = json.loads((out / "judge.json").read_text())
+        self.assertEqual(document["kernels"], THREE)
+        self.assertEqual(document["differential"], "ran")
+        kernels = document["differential_report"]
+        self.assertTrue(kernels["matched"])
+        self.assertTrue(kernels["closure_digest_equal"])
+        self.assertEqual(kernels["failures"], {})
+        self.assertEqual(len({kernels["python_digest"], kernels["souffle_digest"],
+                              kernels["compiled_digest"]}), 1)
+        for field in ("interpreter_seconds", "compiled_seconds", "python_seconds"):
+            self.assertGreater(kernels[field], 0.0, field)
+        self.assertRegex(document["compiled"]["binary_sha256"], HEX64)
+        self.assertEqual(document["compiled"]["schema"], "capcov-souffle-compiled-v1")
+        self.assertEqual(document["compiled"]["program_digest"], document["pack"]["program_digest"])
 
     def test_the_synthetic_receipt_is_supported_and_exits_zero(self) -> None:
         """The positive exit-0 path, on the corpus fixture whose every fact is made up.
@@ -213,8 +271,8 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["verdict"], "not-supported")
         self.assertEqual(document["exit_code"], 1)
         self.assertEqual(document["unmet_ops"], ["delete-issue"])
-        self.assertTrue(document["differential_report"]["matched"],
-                        "the kernels still agree; the op does not qualify")
+        # the kernels that ran still agree; the op does not qualify
+        self.assert_kernels_recorded(document)
         entry = document["ops"]["delete-issue"]
         self.assertEqual(entry["verdict"], "not-supported")
         self.assertEqual(entry["op_qualified"]["semantic"], "unresolved")
@@ -247,7 +305,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["exit_code"], 1)
         self.assertEqual(document["unmet_ops"], ["delete-issue"])
         self.assertEqual(document["ops"]["delete-issue"]["op_qualified"]["semantic"], "unresolved")
-        self.assertTrue(document["differential_report"]["matched"], "the kernels still agree")
+        self.assert_kernels_recorded(document)
 
         # the synthetic receipt needs no requirement to be judged supported
         completed, out = self.judge(replay_join.SYNTHETIC_RECEIPT_DIR, "no-requirement-synthetic")
@@ -354,6 +412,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertIn("unknown evaluator 'z3'", completed.stderr)
         self.assertFalse(out.exists())
 
+    @unittest.skipUnless(HAVE_SOUFFLE, SOUFFLE_ONLY)
     def test_bench_scales_the_receipt_and_records_both_medians(self) -> None:
         out = self.out("bench")
         completed = self.run_script(
@@ -383,6 +442,7 @@ class CompiledCheckerScriptTests(unittest.TestCase):
         self.assertEqual(document["rows_in"], single["rows_in"] + scaled_rows)
         self.assertTrue(single["closures_identical"])
 
+    @unittest.skipUnless(HAVE_SOUFFLE, SOUFFLE_ONLY)
     def test_compile_prints_the_provenance_of_each_pack(self) -> None:
         digests = {}
         for pack in ("replay", "static"):
